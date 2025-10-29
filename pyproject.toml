@@ -12,3 +12,8 @@ dependencies = [
     "tensorflow>=2.20.0",
     "tqdm>=4.67.1",
 ]
+
+[project.optional-dependencies]
+cuda = [
+    "tensorflow[and-cuda]>=2.20.0",
+]
