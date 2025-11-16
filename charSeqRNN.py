@@ -69,10 +69,11 @@ class charSeqRNN(object):
         if self.args['seed']==-1:
             self.args['seed']=datetime.now().microsecond
         np.random.seed(self.args['seed'])
-        tf.set_random_seed(self.args['seed'])
+        # tf.set_random_seed(self.args['seed'])
+        tf.compat.v1.set_random_seed(self.args['seed'])
                                         
         #Start tensorflow
-        self.sess = tf.Session()
+        self.sess = tf.compat.v1.Session()
         
         #--------------Dataset pipeline--------------
         #First we put the datasets on the graph. It's a bit tricky since we need to be able to select between different
@@ -770,9 +771,9 @@ def parseDataset(singleExample, nSteps, nInputs, nClasses, whiteNoiseSD=0.0, con
     """
     Parsing function for the .tfrecord file synthetic data. Returns a synthetic snippet with added noise for training.
     """
-    features = {"inputs": tf.FixedLenFeature((nSteps, nInputs), tf.float32),
-                "labels": tf.FixedLenFeature((nSteps, nClasses), tf.float32),
-                "errWeights": tf.FixedLenFeature((nSteps), tf.float32),}
+    features = {"inputs": tf.io.FixedLenFeature((nSteps, nInputs), tf.float32),
+                "labels": tf.io.FixedLenFeature((nSteps, nClasses), tf.float32),
+                "errWeights": tf.io.FixedLenFeature((nSteps), tf.float32),}
     parsedFeatures = tf.parse_single_example(singleExample, features)
         
     noise = tf.random_normal([nSteps, nInputs], mean=0.0, stddev=whiteNoiseSD)
@@ -784,27 +785,162 @@ def parseDataset(singleExample, nSteps, nInputs, nClasses, whiteNoiseSD=0.0, con
         
     return parsedFeatures["inputs"]+noise, parsedFeatures["labels"], parsedFeatures["errWeights"]
 
+
+def _prepare_initial_state(initRNNState, nBatch, nUnits, direction):
+    """
+    Prepares the initial state tensor(s) for Keras GRU/Bidirectional layers.
+
+    Args:
+        initRNNState (tf.Tensor or None): The initial state tensor from the original function.
+                                          Expected shape (1, nBatch, nUnits) for a single layer.
+        nBatch (int): Batch size.
+        nUnits (int): Number of units in the GRU layer.
+        direction (str): The direction of the RNN ('forward', 'backward', or 'bidirectional').
+
+    Returns:
+        tf.Tensor or list of tf.Tensor or None: Prepared initial state(s) for Keras.
+    """
+    if initRNNState is None:
+        return None
+
+    # Validate shape of initRNNState from original context: (num_layers, nBatch, nUnits)
+    if len(initRNNState.shape) != 3 or initRNNState.shape[1] != nBatch or initRNNState.shape[2] != nUnits:
+        raise ValueError(f"initRNNState has an unexpected shape: {initRNNState.shape}. "
+                         f"Expected (num_layers, nBatch, nUnits) like (1, {nBatch}, {nUnits}).")
+
+    if initRNNState.shape[0] == 1:
+        single_layer_state = initRNNState[0] # Squeeze num_layers dimension: (nBatch, nUnits)
+        if direction == 'bidirectional':
+            # For Bidirectional, Keras expects [forward_state, backward_state].
+            # Assuming the single provided state is for the forward direction,
+            # and the backward direction is zero-initialized.
+            backward_state = tf.zeros_like(single_layer_state)
+            return [single_layer_state, backward_state]
+        else:
+            return single_layer_state
+    else:
+        # If initRNNState has more than 1 layer, it's incompatible with a "SingleLayer" function.
+        raise ValueError(f"initRNNState has {initRNNState.shape[0]} layers, but this function is for a single layer. "
+                         f"Expected initRNNState.shape[0] == 1 for single-layer GRU.")
+
+
 def cudnnGraphSingleLayer(nUnits, initRNNState, batchInputs, nSteps, nBatch, nInputs, direction):
     """
-    Construct a single GRU layer using tensorflow cudnn calls for speed and define the shape before runtime. 
-    Also return the weights so we can do L2 regularization.
+    Construct a single GRU layer using TensorFlow Keras layers, leveraging cuDNN if available
+    for speed, and implicitly defining the input shape through the layer's first call.
+    Also return the trainable weights for L2 regularization.
+
+    Args:
+        nUnits (int): Number of units in the GRU layer.
+        initRNNState (tf.Tensor or None): Initial state tensor. Expected shape (1, nBatch, nUnits)
+                                         for a single layer. If 'bidirectional', this state is used
+                                         for the forward pass, and the backward pass is zero-initialized.
+                                         Can be None for zero-initialization.
+        batchInputs (tf.Tensor): Input tensor of shape (nBatch, nSteps, nInputs).
+        nSteps (int): Number of time steps (kept for signature compatibility, inferred from batchInputs).
+        nBatch (int): Batch size (kept for signature compatibility, inferred from batchInputs).
+        nInputs (int): Number of input features (kept for signature compatibility, inferred from batchInputs).
+        direction (str): Direction of the RNN. One of 'forward', 'backward', or 'bidirectional'.
+
+    Returns:
+        tuple: A tuple containing:
+            - y_cudnn (tf.Tensor): Output tensor of shape (nBatch, nSteps, nUnits) for 'forward'/'backward',
+                                   or (nBatch, nSteps, 2 * nUnits) for 'bidirectional'.
+            - weights (list): A list of trainable weight tensors (kernel and recurrent_kernel)
+                              for L2 regularization.
     """
-    nLayers = 1
-    rnn_cudnn = tf.contrib.cudnn_rnn.CudnnGRU(nLayers, 
-                                              nUnits, 
-                                              dtype=tf.float32, 
-                                              bias_initializer=tf.constant_initializer(0.0), 
-                                              direction=direction)
     
-    inputSize = [nSteps, nBatch, nInputs]
-    rnn_cudnn.build(inputSize)
+    # Keras GRU layers expect input (batch, timesteps, features).
+    # The `batchInputs` tensor (nBatch, nSteps, nInputs) already matches this format.
+    # No transposition is needed.
+
+    # Prepare initial state based on direction and input state tensor.
+    # If initRNNState is None, _prepare_initial_state returns None.
+    # Otherwise, it returns (nBatch, nUnits) for unidirectional,
+    # or [(nBatch, nUnits), (nBatch, nUnits)] for bidirectional.
+    prepared_init_state = _prepare_initial_state(initRNNState, nBatch, nUnits, direction)
+
+    # Bias initializer: tf.constant_initializer(0.0) is equivalent to Zeros()
+    bias_initializer = tf.keras.initializers.Zeros()
+
+    if direction == 'forward':
+        gru_layer = tf.keras.layers.GRU(
+            units=nUnits,
+            activation='tanh',            # Default activation for GRU
+            recurrent_activation='sigmoid', # Default recurrent activation for GRU
+            use_bias=True,
+            bias_initializer=bias_initializer,
+            return_sequences=True,        # Output for each timestep
+            return_state=True,            # Return the final hidden state (though not returned by this function's tuple)
+            reset_after=True,             # Matches cuDNN GRU behavior in TF2 for better performance
+        )
+        
+        # Call the layer. The first call builds the layer based on input shape.
+        outputs, final_state = gru_layer(batchInputs, initial_state=prepared_init_state)
+        
+        y_cudnn = outputs
+        
+        # Collect weights for L2 regularization: kernel (input weights) and recurrent_kernel (recurrent weights)
+        trainable_weights = [gru_layer.kernel, gru_layer.recurrent_kernel]
+
+    elif direction == 'backward':
+        gru_layer = tf.keras.layers.GRU(
+            units=nUnits,
+            activation='tanh',
+            recurrent_activation='sigmoid',
+            use_bias=True,
+            bias_initializer=bias_initializer,
+            return_sequences=True,
+            return_state=True,
+            go_backwards=True,            # This sets the GRU to process sequences in reverse
+            reset_after=True,
+        )
+        outputs, final_state = gru_layer(batchInputs, initial_state=prepared_init_state)
+        
+        y_cudnn = outputs
+        trainable_weights = [gru_layer.kernel, gru_layer.recurrent_kernel]
+
+    elif direction == 'bidirectional':
+        # For Bidirectional, initial_state needs [forward_state, backward_state].
+        # `prepared_init_state` handles this by providing a list of two tensors or None.
+        
+        bidirectional_layer = tf.keras.layers.Bidirectional(
+            tf.keras.layers.GRU(
+                units=nUnits,
+                activation='tanh',
+                recurrent_activation='sigmoid',
+                use_bias=True,
+                bias_initializer=bias_initializer,
+                return_sequences=True,
+                return_state=True, # Bidirectional returns (output, forward_h, backward_h)
+                reset_after=True,
+            ),
+            # Default merge_mode is 'concat', which means outputs are concatenated along the feature axis.
+            # This results in an output shape of (nBatch, nSteps, 2 * nUnits).
+        )
+        
+        # Call the bidirectional layer.
+        # Outputs will be concatenated. States will be (forward_h, backward_h).
+        if prepared_init_state is not None:
+            outputs, forward_h, backward_h = bidirectional_layer(batchInputs, initial_state=prepared_init_state)
+        else:
+            outputs, forward_h, backward_h = bidirectional_layer(batchInputs)
+        
+        y_cudnn = outputs
+        
+        # Collect weights from both forward and backward layers for regularization
+        trainable_weights = [
+            bidirectional_layer.forward_layer.kernel,
+            bidirectional_layer.forward_layer.recurrent_kernel,
+            bidirectional_layer.backward_layer.kernel,
+            bidirectional_layer.backward_layer.recurrent_kernel,
+        ]
+
+    else:
+        raise ValueError(f"Unsupported direction: {direction}. Must be 'forward', 'backward', or 'bidirectional'.")
     
-    #taking care to transpose the inputs and outputs for compatability with the rest of the code which is batch-first
-    cudnnInput = tf.transpose(batchInputs,[1,0,2])
-    y_cudnn, state_cudnn = rnn_cudnn(cudnnInput, initial_state=(initRNNState,))
-    y_cudnn = tf.transpose(y_cudnn,[1,0,2])
-    
-    return y_cudnn, [rnn_cudnn.weights[0]]
+    return y_cudnn, trainable_weights
+
                     
 def gaussSmooth(inputs, kernelSD):
     """
