@@ -101,14 +101,28 @@ def generateCharacterSequences(args):
     def _floats_feature(value):
         return tf.train.Feature(float_list=tf.train.FloatList(value=value))
     
-    writer = tf.python_io.TFRecordWriter(args['saveFile'])
-    for trialIdx in range(args['nSentences']):
-        feature = {'inputs': _floats_feature(np.ravel(synthNeuralBinned[trialIdx,:,:]).tolist()),
-            'labels': _floats_feature(np.ravel(synthTargetsBinned[trialIdx,:,:]).tolist()),
-            'errWeights': _floats_feature(np.ravel(errWeights[trialIdx,:]).tolist())}
+    # The corrected writing loop
+    # Use tf.io.TFRecordWriter instead of tf.python_io.TFRecordWriter
+    with tf.io.TFRecordWriter(args['saveFile']) as writer:
+        for trialIdx in range(args['nSentences']):
+            feature = {
+                'inputs': _floats_feature(np.ravel(synthNeuralBinned[trialIdx,:,:]).tolist()),
+                'labels': _floats_feature(np.ravel(synthTargetsBinned[trialIdx,:,:]).tolist()),
+                'errWeights': _floats_feature(np.ravel(errWeights[trialIdx,:]).tolist())
+            }
+            
+            # This part remains exactly the same
+            example = tf.train.Example(features=tf.train.Features(feature=feature))
+            writer.write(example.SerializeToString())
+    
+    # writer = tf.python_io.TFRecordWriter(args['saveFile'])
+    # for trialIdx in range(args['nSentences']):
+    #     feature = {'inputs': _floats_feature(np.ravel(synthNeuralBinned[trialIdx,:,:]).tolist()),
+    #         'labels': _floats_feature(np.ravel(synthTargetsBinned[trialIdx,:,:]).tolist()),
+    #         'errWeights': _floats_feature(np.ravel(errWeights[trialIdx,:]).tolist())}
 
-        example = tf.train.Example(features=tf.train.Features(feature=feature))
-        writer.write(example.SerializeToString())
+    #     example = tf.train.Example(features=tf.train.Features(feature=feature))
+    #     writer.write(example.SerializeToString())
 
     writer.close()
     
