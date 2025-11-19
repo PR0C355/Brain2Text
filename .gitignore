@@ -1,6 +1,9 @@
 __pycache__
 .ipynb_checkpoints
 handwritingBCIData/
+backupBCIData
+archive.tar.gz
+.DS_Store
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
