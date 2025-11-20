@@ -119,7 +119,7 @@ class charSeqRNN(object):
                     newDataset = newDataset.apply(
                         tf.data.experimental.shuffle_and_repeat(int(4))
                     )
-                    synthIter = newDataset.make_one_shot_iterator()
+                    synthIter = tf.compat.v1.data.make_one_shot_iterator(dataset=newDataset)
                 else:
                     synthIter = []
 
