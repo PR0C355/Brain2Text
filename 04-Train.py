@@ -12,7 +12,7 @@ import matplotlib
 import matplotlib.pyplot as plt
 import pickle
 from datetime import datetime
-from charSeqRNN import charSeqRNN, getDefaultRNNArgs
+from charSeqRnnMigrate import charSeqRNN, getDefaultRNNArgs
 
 # point this towards the top level dataset directory
 rootDir = os.path.expanduser(".") + "/backupBCIData/"
@@ -91,7 +91,7 @@ pickle.dump(args, open(args["outputDir"] + "/args.p", "wb"))
 import os
 
 argsFile = args["outputDir"] + "/args.p"
-scriptFile = os.getcwd() + "/charSeqRNN.py"
+scriptFile = os.getcwd() + "/charSeqRnnMigrate.py"
 os.system("python3 " + scriptFile + " --argsFile=" + argsFile + " &")
 
 
