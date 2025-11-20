@@ -1021,11 +1021,11 @@ def addMeanNoise(
     Applies mean drift noise to each time step of the data in the form of constant offsets (sd=sdConstant)
     and random walk noise (sd=sdRandomWalk)
     """
-    meanDriftNoise = tf.random_normal(
+    meanDriftNoise = tf.random.normal(
         [1, int(inputs.shape[1])], mean=0, stddev=constantOffsetSD
     )
     meanDriftNoise += tf.cumsum(
-        tf.random_normal([nSteps, int(inputs.shape[1])], mean=0, stddev=randomWalkSD),
+        tf.random.normal([nSteps, int(inputs.shape[1])], mean=0, stddev=randomWalkSD),
         axis=1,
     )
 
@@ -1036,7 +1036,7 @@ def addWhiteNoise(inputs, targets, errWeight, numBinsPerTrial, whiteNoiseSD, nSt
     """
     Applies white noise to each time step of the data (sd=whiteNoiseSD)
     """
-    whiteNoise = tf.random_normal(
+    whiteNoise = tf.random.normal(
         [nSteps, int(inputs.shape[1])], mean=0, stddev=whiteNoiseSD
     )
 
@@ -1060,14 +1060,14 @@ def parseDataset(
         "labels": tf.io.FixedLenFeature((nSteps, nClasses), tf.float32),
         "errWeights": tf.io.FixedLenFeature((nSteps), tf.float32),
     }
-    parsedFeatures = tf.parse_single_example(singleExample, features)
+    parsedFeatures = tf.io.parse_single_example(singleExample, features)
 
-    noise = tf.random_normal([nSteps, nInputs], mean=0.0, stddev=whiteNoiseSD)
+    noise = tf.random.normal([nSteps, nInputs], mean=0.0, stddev=whiteNoiseSD)
 
     if constantOffsetSD > 0 or randomWalkSD > 0:
-        trainNoise_mn = tf.random_normal([1, nInputs], mean=0, stddev=constantOffsetSD)
+        trainNoise_mn = tf.random.normal([1, nInputs], mean=0, stddev=constantOffsetSD)
         trainNoise_mn += tf.cumsum(
-            tf.random_normal([nSteps, nInputs], mean=0, stddev=randomWalkSD), axis=1
+            tf.random.normal([nSteps, nInputs], mean=0, stddev=randomWalkSD), axis=1
         )
         noise += trainNoise_mn
 
