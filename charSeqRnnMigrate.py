@@ -79,13 +79,23 @@ class charSeqRNN(object):
         np.random.seed(self.args["seed"])
         tf.random.set_seed(self.args["seed"])
 
+        self.strategy = self._init_strategy()
+        self.use_strategy = self.strategy.num_replicas_in_sync > 1
+        if self.use_strategy:
+            print(
+                "Using MirroredStrategy with "
+                + str(self.strategy.num_replicas_in_sync)
+                + " replicas."
+            )
+
         self.dayToLayerMap = eval(self.args["dayToLayerMap"])
         self.dayProbability = np.array(eval(self.args["dayProbability"]))
         self.nInpLayers = len(np.unique(self.dayToLayerMap))
         self.is_bidirectional = self.args["directionality"] == "bidirectional"
         self.skipLen = int(self.args["skipLen"])
 
-        self._build_layers_and_variables(nInputs, nOutputs)
+        with self.strategy.scope():
+            self._build_layers_and_variables(nInputs, nOutputs)
 
         # --------------Dataset pipeline--------------
         self._setup_datasets(
@@ -98,10 +108,21 @@ class charSeqRNN(object):
         )
 
         os.makedirs(self.args["outputDir"], exist_ok=True)
-        self._create_checkpoint_objects()
+        with self.strategy.scope():
+            self._create_checkpoint_objects()
 
-        # Initialize all variables in the model, potentially loading them if self.loadingInitParams==True
-        self._loadAndInitializeVariables()
+            # Initialize all variables in the model, potentially loading them if self.loadingInitParams==True
+            self._loadAndInitializeVariables()
+
+    def _init_strategy(self):
+        """
+        Create a distribution strategy. If multiple GPUs are visible, use MirroredStrategy to
+        replicate the model across them; otherwise fall back to the default strategy.
+        """
+        gpus = tf.config.list_logical_devices("GPU")
+        if len(gpus) > 1:
+            return tf.distribute.MirroredStrategy()
+        return tf.distribute.get_strategy()
 
     def _build_layers_and_variables(self, nInputs, nOutputs):
         biDir = 2 if self.is_bidirectional else 1
@@ -250,7 +271,32 @@ class charSeqRNN(object):
             vars_list.append(self.readout_b)
         return vars_list
 
-    def _forward_and_loss(self, batch_inputs, batch_targets, batch_weight, day_num):
+    def _distribute_batch(self, tensor):
+        if not self.use_strategy:
+            return tensor
+
+        num_replicas = self.strategy.num_replicas_in_sync
+        batch_dim = tf.shape(tensor)[0]
+        tf.debugging.assert_equal(
+            batch_dim % num_replicas,
+            0,
+            message="Batch size must be divisible by the number of replicas for multi-GPU training.",
+        )
+
+        splits = tf.split(tensor, num_replicas)
+        split_stack = tf.stack(splits)
+        return self.strategy.experimental_distribute_values_from_function(
+            lambda ctx: split_stack[ctx.replica_id_in_sync_group]
+        )
+
+    def _concat_per_replica(self, distributed_tensor, axis=0):
+        if not self.use_strategy:
+            return distributed_tensor
+        return tf.concat(self.strategy.experimental_local_results(distributed_tensor), axis=axis)
+
+    def _forward_and_loss(
+        self, batch_inputs, batch_targets, batch_weight, day_num, global_batch_size=None
+    ):
         inp_W, inp_b = self._input_layer_for_day(day_num)
         tiled_W = tf.tile(
             tf.expand_dims(inp_W, 0), [tf.shape(batch_inputs)[0], 1, 1]
@@ -293,14 +339,21 @@ class charSeqRNN(object):
         ceLoss = tf.nn.softmax_cross_entropy_with_logits(
             labels=labels_main, logits=logits_main
         )
-        totalErr = tf.reduce_mean(
-            tf.reduce_sum(bw * ceLoss, axis=1) / tf.cast(self.args["timeSteps"], tf.float32)
-        )
+        step_len = tf.cast(self.args["timeSteps"], tf.float32)
+
+        ce_per_example = tf.reduce_sum(bw * ceLoss, axis=1) / step_len
 
         sqErrLoss = tf.square(tf.sigmoid(transOut) - transLabel)
-        totalErr += 5 * tf.reduce_mean(
-            tf.reduce_sum(sqErrLoss, axis=1) / tf.cast(self.args["timeSteps"], tf.float32)
-        )
+        sq_per_example = tf.reduce_sum(sqErrLoss, axis=1) / step_len
+
+        per_example_total = ce_per_example + 5 * sq_per_example
+
+        if global_batch_size is None:
+            totalErr = tf.reduce_mean(per_example_total)
+        else:
+            totalErr = tf.nn.compute_average_loss(
+                per_example_total, global_batch_size=tf.cast(global_batch_size, tf.float32)
+            )
 
         l2cost = tf.constant(0.0, dtype=tf.float32)
         if self.args["l2scale"] > 0:
@@ -735,6 +788,24 @@ class charSeqRNN(object):
         self._set_learning_rate(lr)
         batch_inputs, batch_targets, batch_weight = self._get_batch(datasetNum, dayNum)
 
+        should_distribute = self.use_strategy
+        static_batch = batch_inputs.shape[0]
+        if should_distribute and static_batch is not None:
+            should_distribute = (static_batch % self.strategy.num_replicas_in_sync) == 0
+        elif should_distribute:
+            dynamic_batch = int(tf.shape(batch_inputs)[0].numpy())
+            should_distribute = (dynamic_batch % self.strategy.num_replicas_in_sync) == 0
+
+        if should_distribute:
+            return self._runBatch_distributed(
+                batch_inputs,
+                batch_targets,
+                batch_weight,
+                dayNum,
+                computeGradient,
+                doGradientUpdate,
+            )
+
         grad_norm_value = 0.0
         trainable_vars = self._trainable_variables()
 
@@ -770,6 +841,104 @@ class charSeqRNN(object):
             "gradNorm": float(grad_norm_value.numpy() if isinstance(grad_norm_value, tf.Tensor) else grad_norm_value),
         }
         return returnDict
+
+    def _runBatch_distributed(
+        self,
+        batch_inputs,
+        batch_targets,
+        batch_weight,
+        dayNum,
+        computeGradient,
+        doGradientUpdate,
+    ):
+        """
+        Distributed minibatch execution across multiple GPUs using MirroredStrategy.
+        """
+        global_batch_size = tf.shape(batch_inputs)[0]
+
+        dist_inputs = self._distribute_batch(batch_inputs)
+        dist_targets = self._distribute_batch(batch_targets)
+        dist_weight = self._distribute_batch(batch_weight)
+
+        def step_fn(replica_inputs, replica_targets, replica_weight):
+            local_grad_norm = tf.constant(0.0, dtype=tf.float32)
+            trainable_vars = self._trainable_variables()
+
+            if computeGradient:
+                with tf.GradientTape() as tape:
+                    forward_result = self._forward_and_loss(
+                        replica_inputs,
+                        replica_targets,
+                        replica_weight,
+                        dayNum,
+                        global_batch_size,
+                    )
+
+                grads = tape.gradient(forward_result["total_cost"], trainable_vars)
+                safe_grads = [
+                    g if g is not None else tf.zeros_like(v)
+                    for g, v in zip(grads, trainable_vars)
+                ]
+
+                if len(safe_grads) > 0:
+                    local_grad_norm = tf.linalg.global_norm(safe_grads)
+                    clipped_grads, _ = tf.clip_by_global_norm(safe_grads, 10.0)
+                    clipped_pairs = list(zip(clipped_grads, trainable_vars))
+                    if doGradientUpdate:
+                        self.optimizer.apply_gradients(clipped_pairs)
+            else:
+                forward_result = self._forward_and_loss(
+                    replica_inputs,
+                    replica_targets,
+                    replica_weight,
+                    dayNum,
+                    global_batch_size,
+                )
+
+            return (
+                forward_result["total_err"],
+                forward_result["logitOutput"],
+                forward_result["rnnOutput"],
+                forward_result["inputFeatures"],
+                local_grad_norm,
+                replica_targets,
+                replica_weight,
+            )
+
+        (
+            per_replica_err,
+            per_replica_logit,
+            per_replica_rnn,
+            per_replica_inputs,
+            per_replica_grad_norm,
+            per_replica_targets,
+            per_replica_weight,
+        ) = self.strategy.run(
+            step_fn, args=(dist_inputs, dist_targets, dist_weight)
+        )
+
+        total_err = self.strategy.reduce(
+            tf.distribute.ReduceOp.SUM, per_replica_err, axis=None
+        )
+        grad_norm_value = self.strategy.reduce(
+            tf.distribute.ReduceOp.MEAN, per_replica_grad_norm, axis=None
+        )
+
+        logitOutput = self._concat_per_replica(per_replica_logit)
+        rnnOutput = self._concat_per_replica(per_replica_rnn)
+        inputFeatures = self._concat_per_replica(per_replica_inputs)
+        targets = self._concat_per_replica(per_replica_targets)
+        batchWeight = self._concat_per_replica(per_replica_weight)
+
+        return {
+            "err": total_err.numpy(),
+            "inputFeatures": inputFeatures.numpy(),
+            "output": rnnOutput.numpy(),
+            "targets": targets.numpy(),
+            "logitOutput": logitOutput.numpy(),
+            "batchWeight": batchWeight.numpy(),
+            "gradNorm": float(grad_norm_value.numpy()),
+        }
 
     def _loadAllDatasets(self):
         """
