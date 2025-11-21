@@ -1345,7 +1345,7 @@ def getDefaultRNNArgs():
         args["sessionName_" + str(x)] = dataDirs[x]
 
     # Specify which GPU to use (on multi-gpu machines, this prevents tensorflow from taking over all GPUs)
-    args["gpuNumber"] = "0"
+    args["gpuNumber"] = "0,1,2,3,4,5,6,7"
 
     # mode can either be 'train' or 'inference'
     args["mode"] = "train"
@@ -1375,7 +1375,7 @@ def getDefaultRNNArgs():
     args["outputDelay"] = 50
 
     # Can be 'unidrectional' (causal) or 'bidirectional' (acausal)
-    args["directionality"] = "unidirectional"
+    args["directionality"] = "forward"
 
     # standard deivation of the constant-offset firing rate drift noise
     args["constantOffsetSD"] = 0.6
