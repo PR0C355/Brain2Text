@@ -11,8 +11,6 @@ import pickle
 from dataPreprocessing import prepareDataCubesForRNN
 import sys
 
-tf.compat.v1.disable_eager_execution()
-
 class charSeqRNN(object):
     """
     This class encapsulates all the functionality needed for training, loading and running the handwriting decoder RNN.
@@ -22,34 +20,32 @@ class charSeqRNN(object):
 
     def __init__(self, args):
         """
-        This function initializes the entire tensorflow graph, including the dataset pipeline and RNN.
-        Along the way, it loads all relevant data and label files needed for training, and initializes the RNN variables to
-        default values (or loads them from a specified file). After initialization is complete, we are ready
-        to either train (charSeqRNN.train) or infer (charSeqRNN.inference).
+        Initialize the RNN, datasets, optimizer, and checkpointing in TensorFlow 2
+        eager mode. After initialization is complete, we are ready to either train
+        (charSeqRNN.train) or infer (charSeqRNN.inference).
         """
         self.args = args
 
-        # parse whether we are loading a model or not, and whether we are training or 'running' (inferring)
+        load_checkpoints = self._list_checkpoint_paths(self.args["loadDir"])
+        has_load_ckpt = len(load_checkpoints) > 0
+
         if self.args["mode"] == "train":
             self.isTraining = True
-            ckpt = tf.train.get_checkpoint_state(self.args["loadDir"])
-            if ckpt == None:
-                # Nothing to load (no checkpoint found here), so we won't resume or try to load anything
+            if not has_load_ckpt:
                 self.loadingInitParams = False
                 self.resumeTraining = False
             elif self.args["loadDir"] == self.args["outputDir"]:
-                # loading from the same place we are saving - assume we are resuming training
                 self.loadingInitParams = True
                 self.resumeTraining = True
             else:
-                # otherwise we will load params but not try to resume a training run, we'll start over
                 self.loadingInitParams = True
                 self.resumeTraining = False
-
         elif self.args["mode"] == "infer":
             self.isTraining = False
             self.loadingInitParams = True
             self.resumeTraining = False
+        else:
+            raise ValueError("mode must be 'train' or 'infer'.")
 
         # count how many days of data are specified
         self.nDays = 0
@@ -71,6 +67,8 @@ class charSeqRNN(object):
         # define the input & output dimensions of the RNN
         nOutputs = targets_all[0].shape[2]
         nInputs = neuralCube_all[0].shape[2]
+        self.nInputs = nInputs
+        self.nOutputs = nOutputs
 
         # this is used later in inference mode
         self.nTrialsInFirstDataset = neuralCube_all[0].shape[0]
@@ -79,58 +77,287 @@ class charSeqRNN(object):
         if self.args["seed"] == -1:
             self.args["seed"] = datetime.now().microsecond
         np.random.seed(self.args["seed"])
-        # tf.set_random_seed(self.args['seed'])
-        tf.compat.v1.set_random_seed(self.args["seed"])
+        tf.random.set_seed(self.args["seed"])
 
-        # Start tensorflow
-        self.sess = tf.compat.v1.Session()
+        self.dayToLayerMap = eval(self.args["dayToLayerMap"])
+        self.dayProbability = np.array(eval(self.args["dayProbability"]))
+        self.nInpLayers = len(np.unique(self.dayToLayerMap))
+        self.is_bidirectional = self.args["directionality"] == "bidirectional"
+        self.skipLen = int(self.args["skipLen"])
+
+        self._build_layers_and_variables(nInputs, nOutputs)
 
         # --------------Dataset pipeline--------------
-        # First we put the datasets on the graph. It's a bit tricky since we need to be able to select between different
-        # days randomly for each minibatch, so we need to place this selection mechanism on the tensorflow graph.
-        allSynthIterators = []
-        allRealIterators = []
-        allValIterators = []
+        self._setup_datasets(
+            neuralCube_all,
+            targets_all,
+            errWeights_all,
+            numBinsPerTrial_all,
+            cvIdx_all,
+            recordFileSet_all,
+        )
+
+        os.makedirs(self.args["outputDir"], exist_ok=True)
+        self._create_checkpoint_objects()
+
+        # Initialize all variables in the model, potentially loading them if self.loadingInitParams==True
+        self._loadAndInitializeVariables()
+
+    def _build_layers_and_variables(self, nInputs, nOutputs):
+        biDir = 2 if self.is_bidirectional else 1
+
+        self.rnnStartState = tf.Variable(
+            tf.zeros([biDir, 1, self.args["nUnits"]], dtype=tf.float32),
+            name="RNN_layer0/startState",
+            trainable=bool(self.args["trainableBackEnd"]),
+        )
+
+        self.inputFactors_W_all = []
+        self.inputFactors_b_all = []
+        for inpLayerIdx in range(self.nInpLayers):
+            self.inputFactors_W_all.append(
+                tf.Variable(
+                    np.identity(nInputs).astype(np.float32),
+                    name="inputFactors_W_" + str(inpLayerIdx),
+                    trainable=bool(self.args["trainableInput"]),
+                )
+            )
+            self.inputFactors_b_all.append(
+                tf.Variable(
+                    np.zeros([nInputs]).astype(np.float32),
+                    name="inputFactors_b_" + str(inpLayerIdx),
+                    trainable=bool(self.args["trainableInput"]),
+                )
+            )
+
+        self.layer1 = self._build_gru_layer("layer1")
+        self.layer2 = self._build_gru_layer("layer2")
+
+        # Build layers so weights exist for checkpointing and L2 collection.
+        dummy_batch = tf.zeros([1, 1, nInputs], dtype=tf.float32)
+        self.layer1(dummy_batch, initial_state=self._initial_state(1), training=False)
+        dummy_top = tf.zeros(
+            [1, 1, self.args["nUnits"] * biDir], dtype=tf.float32
+        )
+        self.layer2(dummy_top, initial_state=self._initial_state(1), training=False)
+
+        self.readout_W = tf.Variable(
+            tf.random.normal(
+                [biDir * self.args["nUnits"], nOutputs],
+                stddev=0.05,
+                dtype=tf.float32,
+            ),
+            name="readout_W",
+            trainable=bool(self.args["trainableBackEnd"]),
+        )
+        self.readout_b = tf.Variable(
+            tf.zeros([nOutputs], dtype=tf.float32),
+            name="readout_b",
+            trainable=bool(self.args["trainableBackEnd"]),
+        )
+
+        expIdx = []
+        for t in range(int(self.args["timeSteps"] / self.skipLen)):
+            expIdx.append(np.zeros([self.skipLen]) + t)
+        expIdx = np.concatenate(expIdx).astype(int)
+        self.expIdx = tf.constant(expIdx, dtype=tf.int32)
+
+        self.optimizer = tf.keras.optimizers.Adam(
+            learning_rate=1.0,
+            beta_1=0.9,
+            beta_2=0.999,
+            epsilon=1e-01,
+        )
+        self.learning_rate = self.optimizer.learning_rate
+        self.global_step = tf.Variable(
+            0, dtype=tf.int64, trainable=False, name="global_step"
+        )
+
+    def _build_gru_layer(self, name):
+        common_args = dict(
+            units=self.args["nUnits"],
+            activation="tanh",
+            recurrent_activation="sigmoid",
+            use_bias=True,
+            return_sequences=True,
+            return_state=True,
+            reset_after=True,
+            trainable=bool(self.args["trainableBackEnd"]),
+        )
+
+        if self.args["directionality"] == "forward":
+            return tf.keras.layers.GRU(name=name, **common_args)
+        elif self.args["directionality"] == "backward":
+            return tf.keras.layers.GRU(name=name, go_backwards=True, **common_args)
+        elif self.args["directionality"] == "bidirectional":
+            return tf.keras.layers.Bidirectional(
+                tf.keras.layers.GRU(name=f"{name}_gru", **common_args),
+                name=name,
+            )
+        else:
+            raise ValueError(
+                f"Unsupported directionality {self.args['directionality']}."
+            )
+
+    def _initial_state(self, batch_size_tensor):
+        batch_size = tf.cast(batch_size_tensor, tf.int32)
+        tiled_state = tf.tile(self.rnnStartState, [1, batch_size, 1])
+        if self.is_bidirectional:
+            forward_state = tiled_state[0]
+            backward_state = tiled_state[1]
+            return [forward_state, backward_state]
+        return tiled_state[0]
+
+    def _input_layer_for_day(self, dayNum):
+        layer_idx = self.dayToLayerMap[dayNum]
+        return self.inputFactors_W_all[layer_idx], self.inputFactors_b_all[layer_idx]
+
+    def _run_layer(self, layer, inputs, initial_state):
+        outputs = layer(inputs, initial_state=initial_state, training=self.isTraining)
+        if isinstance(layer, tf.keras.layers.Bidirectional):
+            return outputs[0]
+        return outputs[0]
+
+    def _layer_weight_vars(self, layer):
+        if isinstance(layer, tf.keras.layers.Bidirectional):
+            return [
+                layer.forward_layer.cell.kernel,
+                layer.forward_layer.cell.recurrent_kernel,
+                layer.backward_layer.cell.kernel,
+                layer.backward_layer.cell.recurrent_kernel,
+            ]
+        return [layer.cell.kernel, layer.cell.recurrent_kernel]
+
+    def _collect_l2_weights(self):
+        weight_vars = [self.readout_W]
+        weight_vars.extend(self.inputFactors_W_all)
+        weight_vars.extend(self._layer_weight_vars(self.layer1))
+        weight_vars.extend(self._layer_weight_vars(self.layer2))
+        return [w for w in weight_vars if w is not None]
+
+    def _trainable_variables(self):
+        vars_list = []
+        for w in self.inputFactors_W_all + self.inputFactors_b_all:
+            if w.trainable:
+                vars_list.append(w)
+        if self.rnnStartState.trainable:
+            vars_list.append(self.rnnStartState)
+        for layer in [self.layer1, self.layer2]:
+            vars_list.extend([v for v in layer.trainable_variables if v.trainable])
+        if self.readout_W.trainable:
+            vars_list.append(self.readout_W)
+        if self.readout_b.trainable:
+            vars_list.append(self.readout_b)
+        return vars_list
+
+    def _forward_and_loss(self, batch_inputs, batch_targets, batch_weight, day_num):
+        inp_W, inp_b = self._input_layer_for_day(day_num)
+        tiled_W = tf.tile(
+            tf.expand_dims(inp_W, 0), [tf.shape(batch_inputs)[0], 1, 1]
+        )
+        inputFactors = tf.matmul(batch_inputs, tiled_W) + inp_b
+        inputFeatures = inputFactors
+        if self.args["smoothInputs"] == 1:
+            inputFeatures = gaussSmooth(
+                inputFeatures, kernelSD=4 / self.args["rnnBinSize"]
+            )
+
+        init_state = self._initial_state(tf.shape(batch_inputs)[0])
+        rnn_output = self._run_layer(self.layer1, inputFeatures, init_state)
+
+        skip_inputs = rnn_output[:, 0 :: self.skipLen, :]
+        init_state_top = self._initial_state(tf.shape(batch_inputs)[0])
+        rnn_output2 = self._run_layer(self.layer2, skip_inputs, init_state_top)
+
+        tiledReadoutWeights = tf.tile(
+            tf.expand_dims(self.readout_W, 0), [tf.shape(batch_inputs)[0], 1, 1]
+        )
+        logitOutput_downsample = tf.matmul(rnn_output2, tiledReadoutWeights) + self.readout_b
+        logitOutput = tf.gather(logitOutput_downsample, self.expIdx, axis=1)
+
+        if self.args["outputDelay"] > 0:
+            labels = batch_targets[:, : -self.args["outputDelay"], :]
+            logits = logitOutput[:, self.args["outputDelay"] :, :]
+            bw = batch_weight[:, : -self.args["outputDelay"]]
+        else:
+            labels = batch_targets
+            logits = logitOutput
+            bw = batch_weight
+
+        transOut = logits[:, :, -1]
+        transLabel = labels[:, :, -1]
+
+        logits_main = logits[:, :, 0:-1]
+        labels_main = labels[:, :, 0:-1]
+
+        ceLoss = tf.nn.softmax_cross_entropy_with_logits(
+            labels=labels_main, logits=logits_main
+        )
+        totalErr = tf.reduce_mean(
+            tf.reduce_sum(bw * ceLoss, axis=1) / tf.cast(self.args["timeSteps"], tf.float32)
+        )
+
+        sqErrLoss = tf.square(tf.sigmoid(transOut) - transLabel)
+        totalErr += 5 * tf.reduce_mean(
+            tf.reduce_sum(sqErrLoss, axis=1) / tf.cast(self.args["timeSteps"], tf.float32)
+        )
+
+        l2cost = tf.constant(0.0, dtype=tf.float32)
+        if self.args["l2scale"] > 0:
+            l2_terms = [tf.reduce_sum(tf.square(v)) for v in self._collect_l2_weights()]
+            if l2_terms:
+                l2cost = tf.add_n(l2_terms)
+
+        totalCost = totalErr + l2cost * self.args["l2scale"]
+
+        return {
+            "total_cost": totalCost,
+            "total_err": totalErr,
+            "logitOutput": logitOutput,
+            "rnnOutput": rnn_output,
+            "inputFeatures": inputFeatures,
+        }
+
+    def _set_learning_rate(self, lr):
+        if hasattr(self.optimizer.learning_rate, "assign"):
+            self.optimizer.learning_rate.assign(lr)
+        else:
+            self.optimizer.learning_rate = lr
+        self.learning_rate = self.optimizer.learning_rate
+
+    def _setup_datasets(
+        self,
+        neuralCube_all,
+        targets_all,
+        errWeights_all,
+        numBinsPerTrial_all,
+        cvIdx_all,
+        recordFileSet_all,
+    ):
         self.daysWithValData = []
+        self.train_synth_iters = []
+        self.train_real_iters = []
+        self.val_iters = []
+        self.inference_iter = None
 
-        # The following if statement constructs the dataset iterators.
         if self.isTraining:
-            # We are in training mode. For each day, we make 'synthetic', 'real', and 'validation' tensorflow dataset iterators.
             for dayIdx in range(self.nDays):
-                # --training data stream (synthetic data)--
+                synthIter = None
                 if self.args["synthBatchSize"] > 0:
-                    mapFnc = lambda singleExample: parseDataset(
-                        singleExample,
+                    synthDataset = self._make_synth_dataset(
+                        recordFileSet_all[dayIdx],
                         self.args["timeSteps"],
-                        nInputs,
-                        nOutputs,
-                        whiteNoiseSD=self.args["whiteNoiseSD"],
-                        constantOffsetSD=self.args["constantOffsetSD"],
-                        randomWalkSD=self.args["randomWalkSD"],
+                        self.nInputs,
+                        self.nOutputs,
                     )
+                    synthIter = iter(synthDataset)
 
-                    newDataset = tf.data.TFRecordDataset(recordFileSet_all[dayIdx])
-                    newDataset = newDataset.apply(
-                        tf.data.experimental.map_and_batch(
-                            map_func=mapFnc,
-                            batch_size=self.args["synthBatchSize"],
-                            drop_remainder=True,
-                        )
-                    )
-                    newDataset = newDataset.apply(
-                        tf.data.experimental.shuffle_and_repeat(int(4))
-                    )
-                    synthIter = tf.compat.v1.data.make_one_shot_iterator(dataset=newDataset)
-                else:
-                    synthIter = []
-
-                # --training data stream (real data, train partition)--
                 realDataSize = self.args["batchSize"] - self.args["synthBatchSize"]
                 trainIdx = cvIdx_all[dayIdx]["trainIdx"]
                 valIdx = cvIdx_all[dayIdx]["testIdx"]
 
                 if realDataSize > 0:
-                    realIter = self._makeTrainingDatasetFromRealData(
+                    realDataset = self._makeTrainingDatasetFromRealData(
                         neuralCube_all[dayIdx][trainIdx, :, :],
                         targets_all[dayIdx][trainIdx, :, :],
                         errWeights_all[dayIdx][trainIdx, :],
@@ -138,15 +365,15 @@ class charSeqRNN(object):
                         realDataSize,
                         addNoise=True,
                     )
+                    realIter = iter(realDataset)
                 else:
-                    realIter = []
+                    realIter = None
 
-                # --validation data stream (real data, test partition)--
                 if len(valIdx) == 0:
                     valIter = realIter
                     valDataExists = False
                 else:
-                    valIter = self._makeTrainingDatasetFromRealData(
+                    valDataset = self._makeTrainingDatasetFromRealData(
                         neuralCube_all[dayIdx][valIdx, :, :],
                         targets_all[dayIdx][valIdx, :, :],
                         errWeights_all[dayIdx][valIdx, :],
@@ -154,17 +381,15 @@ class charSeqRNN(object):
                         self.args["batchSize"],
                         addNoise=False,
                     )
+                    valIter = iter(valDataset)
                     valDataExists = True
 
-                allSynthIterators.append(synthIter)
-                allRealIterators.append(realIter)
-                allValIterators.append(valIter)
+                self.train_synth_iters.append(synthIter)
+                self.train_real_iters.append(realIter)
+                self.val_iters.append(valIter)
                 if valDataExists:
                     self.daysWithValData.append(dayIdx)
         else:
-            # We are in inference mode. We make a tensorflow iterator for the real data stream only
-            # (no synthetic data or validation data). Also, we place only the first days' data on the graph.
-            # Inference mode currently only supports running through a single dataset at a time.
             newDataset = tf.data.Dataset.from_tensor_slices(
                 (
                     neuralCube_all[0].astype(np.float32),
@@ -173,294 +398,131 @@ class charSeqRNN(object):
                     numBinsPerTrial_all[0].astype(np.int32),
                 )
             )
-            newDataset = newDataset.repeat()
             newDataset = newDataset.batch(self.args["batchSize"])
+            newDataset = newDataset.repeat()
+            newDataset = newDataset.prefetch(tf.data.AUTOTUNE)
+            self.inference_iter = iter(newDataset)
 
-            iterator = tf.compat.v1.data.make_initializable_iterator(newDataset)
-            self.sess.run(iterator.initializer)
-
-            allRealIterators.append(iterator)
-            allSynthIterators.append([])
-            allValIterators.append(iterator)
-
-        # With the dataset iterators in hand, we now construct the selection mechanism to switch between different
-        # days for each minibatch. As part of this, we also have to combine the real data and synthetic data into a single minibatch.
-        # Note that 'dayNum' selects between the days of data, while 'datasetNum' also selects between train vs. test datasets.
-        # Even datasetNums are training datasets and odd datasetNums are validation datasets.
-        self.datasetNumPH = tf.compat.v1.placeholder(tf.int32, shape=[])
-        self.dayNumPH = tf.compat.v1.placeholder(tf.int32, shape=[])
-
-        def pruneValDataset(valIter):
-            inp, targ, weight, bins = valIter.get_next()
-            return inp, targ, weight
-
-        def makeValDatasetFunc(x):
-            return lambda: pruneValDataset(allValIterators[x])
-
-        def combineSynthAndReal(synthIter, realIter):
-            if synthIter == []:
-                inp, targ, weight, bins = realIter.get_next()
-            elif realIter == []:
-                inp, targ, weight = synthIter.get_next()
-            else:
-                inp_r, targ_r, weight_r, bins_r = realIter.get_next()
-                inp_s, targ_s, weight_s = synthIter.get_next()
-
-                inp = tf.concat([inp_s, inp_r], axis=0)
-                targ = tf.concat([targ_s, targ_r], axis=0)
-                weight = tf.concat([weight_s, weight_r], axis=0)
-
-            return inp, targ, weight
-
-        def makeTrainDatasetFunc(x):
-            return lambda: combineSynthAndReal(
-                allSynthIterators[x], allRealIterators[x]
-            )
-
-        branchFuns = []
-        for datIdx in range(self.nDays):
-            branchFuns.extend(
-                [makeTrainDatasetFunc(datIdx), makeValDatasetFunc(datIdx)]
-            )
-
-        # These variables ('batchInputs', 'batchTargets', 'batchWeight') are the output of the day-selector mechanism
-        # and are all that is needed moving forward to define the RNN cost function.
-        self.batchInputs, self.batchTargets, self.batchWeight = tf.switch_case(
-            self.datasetNumPH, branchFuns
-        )
-
-        self.batchWeight.set_shape([self.args["batchSize"], self.args["timeSteps"]])
-        self.batchInputs.set_shape(
-            [self.args["batchSize"], self.args["timeSteps"], nInputs]
-        )
-        self.batchTargets.set_shape(
-            [self.args["batchSize"], self.args["timeSteps"], nOutputs]
-        )
-
-        # --------------RNN Graph--------------
-        # First, some simple Gaussian smoothing.
-        if self.args["smoothInputs"] == 1:
-            self.batchInputs = gaussSmooth(
-                self.batchInputs, kernelSD=4 / self.args["rnnBinSize"]
-            )
-
-        # Define the RNN start state, which is trainable.
-        if self.args["directionality"] == "bidirectional":
-            biDir = 2
-        else:
-            biDir = 1
-
-        self.rnnStartState = tf.compat.v1.get_variable(
-            "RNN_layer0/startState",
-            [biDir, 1, self.args["nUnits"]],
-            dtype=tf.float32,
-            initializer=tf.compat.v1.zeros_initializer,
-            trainable=bool(self.args["trainableBackEnd"]),
-        )
-
-        # tile the state across all elements of the minibatch
-        initRNNState = tf.tile(self.rnnStartState, [1, self.args["batchSize"], 1])
-
-        # Define the day-specific input layers.
-        self.dayToLayerMap = eval(self.args["dayToLayerMap"])
-        self.dayProbability = eval(self.args["dayProbability"])
-        self.nInpLayers = len(np.unique(self.dayToLayerMap))
-
-        self.inputFactors_W_all = []
-        self.inputFactors_b_all = []
-        for inpLayerIdx in range(self.nInpLayers):
-            self.inputFactors_W_all.append(
-                tf.compat.v1.get_variable(
-                    "inputFactors_W_" + str(inpLayerIdx),
-                    initializer=np.identity(nInputs).astype(np.float32),
-                    trainable=bool(self.args["trainableInput"]),
-                )
-            )
-
-            self.inputFactors_b_all.append(
-                tf.compat.v1.get_variable(
-                    "inputFactors_b_" + str(inpLayerIdx),
-                    initializer=np.zeros([nInputs]).astype(np.float32),
-                    trainable=bool(self.args["trainableInput"]),
-                )
-            )
-
-        # Define the selector mechanism that chooses which input layer to use depending on which day we have selected
-        # for the minibatch.
-        def makeFactorsFunc(x):
-            return lambda: (
-                self.inputFactors_W_all[self.dayToLayerMap[x]],
-                self.inputFactors_b_all[self.dayToLayerMap[x]],
-            )
-
-        branchFuns_inpLayers = []
-        for dayIdx in range(self.nDays):
-            branchFuns_inpLayers.append(makeFactorsFunc(dayIdx))
-
-        # inp_W and inp_b are the chosen input layer variables
-        inp_W, inp_b = tf.switch_case(self.dayNumPH, branchFuns_inpLayers)
-
-        #'inputFactors' are the transformed inputs which should now be in a common space across days.
-        self.inputFactors = (
-            tf.matmul(
-                self.batchInputs,
-                tf.tile(tf.expand_dims(inp_W, 0), [self.args["batchSize"], 1, 1]),
-            )
-            + inp_b
-        )
-
-        # Now define the two GRU layers. Layer 1, which runs at a high frequency:
-        self.rnnOutput, self.rnnWeightVars = cudnnGraphSingleLayer(
-            self.args["nUnits"],
-            initRNNState,
-            self.inputFactors,
-            self.args["timeSteps"],
-            self.args["batchSize"],
+    def _make_synth_dataset(self, record_files, nSteps, nInputs, nOutputs):
+        if len(record_files) == 0:
+            return None
+        mapFnc = lambda singleExample: parseDataset(
+            singleExample,
+            nSteps,
             nInputs,
-            self.args["directionality"],
+            nOutputs,
+            whiteNoiseSD=self.args["whiteNoiseSD"],
+            constantOffsetSD=self.args["constantOffsetSD"],
+            randomWalkSD=self.args["randomWalkSD"],
+        )
+        newDataset = tf.data.TFRecordDataset(record_files)
+        newDataset = newDataset.map(mapFnc, num_parallel_calls=tf.data.AUTOTUNE)
+        newDataset = newDataset.shuffle(4).repeat()
+        newDataset = newDataset.batch(
+            self.args["synthBatchSize"], drop_remainder=True
+        )
+        newDataset = newDataset.prefetch(tf.data.AUTOTUNE)
+        return newDataset
+
+    def _get_batch(self, datasetNum, dayNum):
+        if self.isTraining:
+            if datasetNum % 2 == 0:
+                return self._next_train_batch(dayNum)
+            return self._next_val_batch(dayNum)
+
+        batch_inputs, batch_targets, batch_weight, _ = next(self.inference_iter)
+        return batch_inputs, batch_targets, batch_weight
+
+    def _next_train_batch(self, dayNum):
+        synthIter = self.train_synth_iters[dayNum]
+        realIter = self.train_real_iters[dayNum]
+        if synthIter is None:
+            inp, targ, weight, _ = next(realIter)
+        elif realIter is None:
+            inp, targ, weight = next(synthIter)
+        else:
+            inp_r, targ_r, weight_r, _ = next(realIter)
+            inp_s, targ_s, weight_s = next(synthIter)
+            inp = tf.concat([inp_s, inp_r], axis=0)
+            targ = tf.concat([targ_s, targ_r], axis=0)
+            weight = tf.concat([weight_s, weight_r], axis=0)
+        return inp, targ, weight
+
+    def _next_val_batch(self, dayNum):
+        valIter = self.val_iters[dayNum]
+        if valIter is None:
+            return self._next_train_batch(dayNum)
+        inp, targ, weight, _ = next(valIter)
+        return inp, targ, weight
+
+    def _list_checkpoint_paths(self, directory):
+        if directory in ["None", None] or not os.path.isdir(directory):
+            return []
+        try:
+            state = tf.train.get_checkpoint_state(directory)
+            if state and state.all_model_checkpoint_paths:
+                return state.all_model_checkpoint_paths
+        except Exception:
+            pass
+        latest = tf.train.latest_checkpoint(directory)
+        return [latest] if latest else []
+
+    def _create_checkpoint_objects(self):
+        self.checkpoint = tf.train.Checkpoint(
+            optimizer=self.optimizer,
+            global_step=self.global_step,
+            rnnStartState=self.rnnStartState,
+            inputFactors_W_all=self.inputFactors_W_all,
+            inputFactors_b_all=self.inputFactors_b_all,
+            layer1=self.layer1,
+            layer2=self.layer2,
+            readout_W=self.readout_W,
+            readout_b=self.readout_b,
+        )
+        self.manager = tf.train.CheckpointManager(
+            self.checkpoint,
+            directory=self.args["outputDir"],
+            max_to_keep=self.args["nCheckToKeep"],
         )
 
-        # Layer 2, which runs at a slower frequency (defined by 'skipLen'):
-        nSkipInputs = self.args["nUnits"]
-        skipLen = self.args["skipLen"]
+    def _loadAndInitializeVariables(self):
+        """
+        Initializes all tensorflow variables, optionally loading their values from a specified file.
+        """
+        checkpoints = self._list_checkpoint_paths(self.args["loadDir"])
+        self.startingBatchNum = 0
 
-        with tf.compat.v1.variable_scope("layer2"):
-            self.rnnOutput2, self.rnnWeightVars2 = cudnnGraphSingleLayer(
-                self.args["nUnits"],
-                initRNNState,
-                self.rnnOutput[:, 0::skipLen, :],
-                self.args["timeSteps"] / skipLen,
-                self.args["batchSize"],
-                self.args["nUnits"] * biDir,
-                self.args["directionality"],
-            )
+        if self.loadingInitParams and len(checkpoints) > 0:
+            load_idx = self.args["loadCheckpointIdx"]
+            if load_idx >= 0 and load_idx < len(checkpoints):
+                checkpoint_path = checkpoints[load_idx]
+            else:
+                checkpoint_path = checkpoints[-1]
 
-        # Finally, define the linear readout layer.
-        self.readout_W = tf.compat.v1.get_variable(
-            "readout_W",
-            shape=[biDir * self.args["nUnits"], nOutputs],
-            initializer=tf.compat.v1.random_normal_initializer(dtype=tf.float32, stddev=0.05),
-            trainable=bool(self.args["trainableBackEnd"]),
-        )
+            print("Loading from checkpoint: " + checkpoint_path)
+            status = self.checkpoint.restore(checkpoint_path)
+            status.expect_partial()
 
-        self.readout_b = tf.compat.v1.get_variable(
-            "readout_b",
-            shape=[nOutputs],
-            initializer=tf.compat.v1.zeros_initializer(dtype=tf.float32),
-            trainable=bool(self.args["trainableBackEnd"]),
-        )
+            if self.resumeTraining:
+                self.startingBatchNum = int(self.global_step.numpy()) + 1
+            else:
+                self.startingBatchNum = 0
 
-        tiledReadoutWeights = tf.tile(
-            tf.expand_dims(self.readout_W, 0), [self.args["batchSize"], 1, 1]
-        )
-        self.logitOutput_downsample = (
-            tf.matmul(self.rnnOutput2, tiledReadoutWeights) + self.readout_b
-        )
-
-        # Up-sample the outputs to the original time-resolution (needed b/c layer 2 is slower).
-        expIdx = []
-        for t in range(int(args["timeSteps"] / skipLen)):
-            expIdx.append(np.zeros([skipLen]) + t)
-        expIdx = np.concatenate(expIdx).astype(int)
-        self.logitOutput = tf.gather(self.logitOutput_downsample, expIdx, axis=1)
-
-        # --------------Loss function--------------
-        # here we accounting for the output delay
-        labels = self.batchTargets[:, 0 : -(args["outputDelay"]), :]
-        logits = self.logitOutput[:, args["outputDelay"] :, :]
-        bw = self.batchWeight[:, 0 : -(args["outputDelay"])]
-
-        # character transition signal is the last column, which has a separate loss
-        transOut = logits[:, :, -1]
-        transLabel = labels[:, :, -1]
-
-        logits = logits[:, :, 0:-1]
-        labels = labels[:, :, 0:-1]
-
-        # cross-entropy character probability loss
-        ceLoss = tf.nn.softmax_cross_entropy_with_logits(
-            labels=labels, logits=logits
-        )
-        self.totalErr = tf.reduce_mean(
-            tf.reduce_sum(bw * ceLoss, axis=1) / self.args["timeSteps"]
-        )
-
-        # character start signal loss
-        sqErrLoss = tf.square(tf.sigmoid(transOut) - transLabel)
-        self.totalErr += 5 * tf.reduce_mean(
-            tf.reduce_sum(sqErrLoss, axis=1) / self.args["timeSteps"]
-        )
-
-        # L2 regularizer
-        weightVars = [self.readout_W]
-        for inpIdx in range(self.nInpLayers):
-            weightVars.append(self.inputFactors_W_all[inpIdx])
-
-        weightVars.extend(self.rnnWeightVars)
-        weightVars.extend(self.rnnWeightVars2)
-
-        self.l2cost = tf.zeros(1, dtype=tf.float32)
-        if self.args["l2scale"] > 0:
-            for x in range(len(weightVars)):
-                self.l2cost = self.l2cost + tf.reduce_sum(tf.square(weightVars[x]))
-
-        # total cost
-        self.totalCost = self.totalErr + self.l2cost * self.args["l2scale"]
-
-        # --------------Gradient descent--------------
-        # prepare gradients and optimizer
-        tvars = tf.compat.v1.get_collection(tf.compat.v1.GraphKeys.TRAINABLE_VARIABLES)
-
-        # option to only allow the input layers to train
-        if not bool(self.args["trainableBackEnd"]):
-            tvars.remove(self.rnnWeightVars[0])
-            tvars.remove(self.rnnWeightVars2[0])
-
-        # clip gradients to a maximum value of 10
-        grads = tf.gradients(self.totalCost, tvars)
-        grads, self.grad_global_norm = tf.clip_by_global_norm(grads, 10)
-
-        # optimization routine & learning rate
-        learnRate = tf.compat.v1.get_variable(
-            "learnRate", dtype=tf.float32, initializer=1.0, trainable=False
-        )
-        opt = tf.compat.v1.train.AdamOptimizer(learnRate, beta1=0.9, beta2=0.999, epsilon=1e-01)
-
-        self.new_lr = tf.compat.v1.placeholder(tf.float32, shape=[], name="new_learning_rate")
-        self.lr_update = tf.compat.v1.assign(learnRate, self.new_lr)
-
-        # check if gradients are finite; if not, don't apply
-        allIsFinite = []
-        for g in grads:
-            if g != None:
-                allIsFinite.append(tf.reduce_all(tf.math.is_finite(g)))
-        gradIsFinite = tf.reduce_all(tf.stack(allIsFinite))
-        self.train_op = tf.cond(
-            gradIsFinite,
-            lambda: opt.apply_gradients(
-                zip(grads, tvars), global_step=tf.compat.v1.train.get_or_create_global_step()
-            ),
-            lambda: tf.no_op(),
-        )
-
-        # Initialize all variables in the model, potentially loading them if self.loadingInitParams==True
-        self._loadAndInitializeVariables()
+    def _save_checkpoint(self, step):
+        self.global_step.assign(step)
+        if hasattr(self, "manager"):
+            self.manager.save(checkpoint_number=step)
 
     def train(self):
         """
-        The main training loop, which we have implemented manually here. Each loop makes a single call to sess.run to execute
-        one minibatch. ALong the way, we periodically save the model and performance statistics.
+        The main training loop, running eagerly with manual gradient updates.
         """
-        saver = tf.compat.v1.train.Saver(max_to_keep=self.args["nCheckToKeep"])
-
-        # Prepare to save performance data from each batch.
         batchTrainStats = np.zeros([self.args["nBatchesToTrain"], 6])
         batchValStats = np.zeros(
             [int(np.ceil(self.args["nBatchesToTrain"] / self.args["batchesPerVal"])), 4]
         )
         i = self.startingBatchNum
 
-        # load up previous statistics if we are resuming.
         if self.resumeTraining:
             resumedStats = scipy.io.loadmat(
                 self.args["outputDir"] + "/intermediateOutput"
@@ -468,31 +530,19 @@ class charSeqRNN(object):
             batchTrainStats = resumedStats["batchTrainStats"]
             batchValStats = resumedStats["batchValStats"]
 
-        # Save initial model parameters.
-        saver.save(
-            self.sess,
-            self.args["outputDir"] + "/model.ckpt",
-            global_step=0,
-            write_meta_graph=False,
-        )
-
-        # This ensures we aren't accidentally changing the graph as we go (which degrades performance).
-        self.sess.graph.finalize()
+        self._save_checkpoint(i)
 
         while i < self.args["nBatchesToTrain"]:
-            # time how long this batch takes
             dtStart = datetime.now()
 
-            # learn rate
             lr = self.args["learnRateStart"] * (
                 1 - i / float(self.args["nBatchesToTrain"])
             ) + self.args["learnRateEnd"] * (i / float(self.args["nBatchesToTrain"]))
 
-            # run train batch, selecting a day at random
             dayNum = np.argwhere(np.random.multinomial(1, self.dayProbability))[0][0]
-            datasetNum = (
-                2 * dayNum
-            )  # 2*dayNum selects the train partition (as opposed to 2*dayNum + 1)
+            datasetNum = 2 * dayNum
+
+            self.global_step.assign(i)
 
             runResultsTrain = self._runBatch(
                 datasetNum=datasetNum,
@@ -502,7 +552,6 @@ class charSeqRNN(object):
                 doGradientUpdate=True,
             )
 
-            # compute the frame-by-frame accuracy for this batch
             trainAcc = computeFrameAccuracy(
                 runResultsTrain["logitOutput"],
                 runResultsTrain["targets"],
@@ -510,7 +559,6 @@ class charSeqRNN(object):
                 self.args["outputDelay"],
             )
 
-            # record useful statistics about this minibatch
             totalSeconds = (datetime.now() - dtStart).total_seconds()
             batchTrainStats[i, :] = [
                 i,
@@ -521,7 +569,6 @@ class charSeqRNN(object):
                 dayNum,
             ]
 
-            # every once in a while, run a validation batch (i.e., run the RNN on the test partition to see how we're doing)
             if i % self.args["batchesPerVal"] == 0:
                 valSetIdx = int(i / self.args["batchesPerVal"])
                 batchValStats[valSetIdx, 0:4], outputSnapshot = (
@@ -535,12 +582,10 @@ class charSeqRNN(object):
                     )
                 )
 
-                # save a snapshot of key RNN outputs/variables so an outside program can plot them if desired
                 scipy.io.savemat(
                     self.args["outputDir"] + "/outputSnapshot", outputSnapshot
                 )
 
-            # save performance statistics and model parameters every so often
             if (
                 i >= (self.startingBatchNum + self.args["batchesPerSave"] - 1)
                 and i % self.args["batchesPerSave"] == 0
@@ -555,47 +600,34 @@ class charSeqRNN(object):
 
             if i % self.args["batchesPerModelSave"] == 0:
                 print("SAVING MODEL")
-                saver.save(
-                    self.sess,
-                    self.args["outputDir"] + "/model.ckpt",
-                    global_step=i,
-                    write_meta_graph=False,
-                )
+                self._save_checkpoint(i)
 
             i += 1
 
-        # save final training statistics over all batches & final model
         scipy.io.savemat(
             self.args["outputDir"] + "/finalOutput",
             {"batchTrainStats": batchTrainStats, "batchValStats": batchValStats},
         )
 
         print("SAVING FINAL MODEL")
-        saver.save(
-            self.sess,
-            self.args["outputDir"] + "/model.ckpt",
-            global_step=i,
-            write_meta_graph=False,
-        )
+        self._save_checkpoint(i)
 
     def inference(self):
         """
         Runs the RNN on the entire dataset once and returns the result - used at inference time for performance evaluation.
         """
 
-        # Compute how many total batches we'll need to run through before we go through everything once
         self.nBatchesForInference = np.ceil(
             self.nTrialsInFirstDataset / self.args["batchSize"]
         ).astype(int)
 
-        # run through the entire dataset once
         allOutputs = []
         allUnits = []
         allInputFeatures = []
 
         print("Starting inference.")
 
-        for x in range(self.nBatchesForInference):
+        for _ in range(self.nBatchesForInference):
             returnDict = self._runBatch(
                 datasetNum=0,
                 dayNum=0,
@@ -610,12 +642,10 @@ class charSeqRNN(object):
 
         print("Done with inference.")
 
-        # concatenate all batches and return
         allOutputs = np.concatenate(allOutputs, axis=0)
         allUnits = np.concatenate(allUnits, axis=0)
         allInputFeatures = np.concatenate(allInputFeatures, axis=0)
 
-        # trim to original size in case the total number of sentences is not a multiple of the batch size
         allOutputs = allOutputs[0 : self.nTrialsInFirstDataset, :, :]
         allUnits = allUnits[0 : self.nTrialsInFirstDataset, :, :]
         allInputFeatures = allInputFeatures[0 : self.nTrialsInFirstDataset, :, :]
@@ -641,14 +671,13 @@ class charSeqRNN(object):
         diagnostic purposes. The snapshot file can be loaded and plotted by an outside program for real-time feedback of how
         the training process is going.
         """
-        # Randomly select a day that has validation data; if there is no validation data, then just use the last days' training data
         if self.daysWithValData == []:
             dayNum = self.nDays - 1
             datasetNum = dayNum * 2
         else:
             randIdx = np.random.randint(len(self.daysWithValData))
             dayNum = self.daysWithValData[randIdx]
-            datasetNum = 1 + dayNum * 2  # odd numbers are the validation partitions
+            datasetNum = 1 + dayNum * 2
 
         runResults = self._runBatch(
             datasetNum=datasetNum,
@@ -701,130 +730,46 @@ class charSeqRNN(object):
 
     def _runBatch(self, datasetNum, dayNum, lr, computeGradient, doGradientUpdate):
         """
-        Makes a single call to sess.run to execute one minibatch. Note that datasetNum and dayNum must be specified so we know
-        which dataset to pull from (datasetNum) and which input layer to use (dayNum).
+        Executes one minibatch with optional gradient computation and update.
         """
-        fd = {
-            self.new_lr: lr,
-            self.datasetNumPH: int(datasetNum),
-            self.dayNumPH: int(dayNum),
-        }
-        runOps = [
-            self.totalErr,
-            self.batchInputs,
-            self.rnnOutput,
-            self.batchTargets,
-            self.logitOutput,
-            self.batchWeight,
-        ]
-        opMap = {}
+        self._set_learning_rate(lr)
+        batch_inputs, batch_targets, batch_weight = self._get_batch(datasetNum, dayNum)
+
+        grad_norm_value = 0.0
+        trainable_vars = self._trainable_variables()
 
         if computeGradient:
-            runOps.extend([self.grad_global_norm])
-            opMap["gradNorm"] = len(runOps) - 1
-
-        if doGradientUpdate:
-            runOps.extend([self.lr_update, self.train_op])
-
-        runResult = self.sess.run(runOps, feed_dict=fd)
-
-        returnDict = {}
-        returnDict["err"] = runResult[0]
-        returnDict["inputFeatures"] = runResult[1]
-        returnDict["output"] = runResult[2]
-        returnDict["targets"] = runResult[3]
-        returnDict["logitOutput"] = runResult[4]
-        returnDict["batchWeight"] = runResult[5]
-
-        if computeGradient:
-            returnDict["gradNorm"] = runResult[opMap["gradNorm"]]
-        else:
-            returnDict["gradNorm"] = 0
-
-        return returnDict
-
-    def _loadAndInitializeVariables(self):
-        """
-        Initializes all tensorflow variables on the graph, optionally loading their values from a specified file.
-        """
-        if self.loadingInitParams:
-            # find the variables in the checkpoint
-            ckpt = tf.train.get_checkpoint_state(self.args["loadDir"])
-            loadCheckPointIdx = self.args["loadCheckpointIdx"]
-            checkpoint_name = os.path.basename(
-                os.path.normpath(ckpt.all_model_checkpoint_paths[loadCheckPointIdx])
-            )
-            checkpoint_path = self.args["loadDir"] + "/" + checkpoint_name
-
-            # print variables in the checkpoint
-            print("Loading from checkpoint: " + checkpoint_path)
-            from tensorflow.contrib.framework.python.framework import checkpoint_utils
-
-            var_list_ckpt = checkpoint_utils.list_variables(checkpoint_path)
-            var_names_ckpt = []
-            for v in var_list_ckpt:
-                var_names_ckpt.append(v[0])
-                # print(v)
-
-            # put together what variables we are going to load from what sources,
-            # with special attention to how the inputFactors are determined
-            lv = [
-                self.readout_W,
-                self.readout_b,
-                self.rnnWeightVars[0],
-                self.rnnWeightVars2[0],
-                self.rnnStartState,
+            with tf.GradientTape() as tape:
+                forward_result = self._forward_and_loss(
+                    batch_inputs, batch_targets, batch_weight, dayNum
+                )
+            grads = tape.gradient(forward_result["total_cost"], trainable_vars)
+            safe_grads = [
+                g if g is not None else tf.zeros_like(v)
+                for g, v in zip(grads, trainable_vars)
             ]
-            varDict = {}
-            for x in range(len(lv)):
-                varDict[lv[x].name[:-2]] = lv[x]
 
-            if self.args["mode"] == "infer":
-                varDict["inputFactors_W_" + str(self.args["inferenceInputLayer"])] = (
-                    self.inputFactors_W_all[0]
-                )
-                varDict["inputFactors_b_" + str(self.args["inferenceInputLayer"])] = (
-                    self.inputFactors_b_all[0]
-                )
-                saver = tf.compat.v1.train.Saver(varDict)
-                lastLayerSavers = []
-            else:
-                lastAvailableInpLayer = -1
-                for inpLayerIdx in range(self.nInpLayers):
-                    if "inputFactors_W_" + str(inpLayerIdx) in var_names_ckpt:
-                        lastAvailableInpLayer = inpLayerIdx
-                        varDict["inputFactors_W_" + str(inpLayerIdx)] = (
-                            self.inputFactors_W_all[inpLayerIdx]
-                        )
-                        varDict["inputFactors_b_" + str(inpLayerIdx)] = (
-                            self.inputFactors_b_all[inpLayerIdx]
-                        )
+            if len(safe_grads) > 0:
+                grad_norm_value = tf.linalg.global_norm(safe_grads)
+                clipped_grads, _ = tf.clip_by_global_norm(safe_grads, 10.0)
+                clipped_pairs = list(zip(clipped_grads, trainable_vars))
+                if doGradientUpdate:
+                    self.optimizer.apply_gradients(clipped_pairs)
+        else:
+            forward_result = self._forward_and_loss(
+                batch_inputs, batch_targets, batch_weight, dayNum
+            )
 
-                saver = tf.compat.v1.train.Saver(varDict)
-
-                lastLayerSavers = []
-                for inpLayerIdx in range(lastAvailableInpLayer + 1, self.nInpLayers):
-                    newDict = {}
-                    newDict["inputFactors_W_" + str(lastAvailableInpLayer)] = (
-                        self.inputFactors_W_all[inpLayerIdx]
-                    )
-                    newDict["inputFactors_b_" + str(lastAvailableInpLayer)] = (
-                        self.inputFactors_b_all[inpLayerIdx]
-                    )
-                    lastLayerSavers.append(tf.compat.v1.train.Saver(newDict))
-
-        self.sess.run(tf.compat.v1.global_variables_initializer())
-        self.startingBatchNum = 0
-        if self.loadingInitParams:
-            saver.restore(self.sess, checkpoint_path)
-            for s in lastLayerSavers:
-                s.restore(self.sess, checkpoint_path)
-
-            if self.resumeTraining:
-                self.startingBatchNum = int(
-                    ckpt.model_checkpoint_path.split("/")[-1].split("-")[-1]
-                )
-                self.startingBatchNum += 1
+        returnDict = {
+            "err": forward_result["total_err"].numpy(),
+            "inputFeatures": forward_result["inputFeatures"].numpy(),
+            "output": forward_result["rnnOutput"].numpy(),
+            "targets": batch_targets.numpy(),
+            "logitOutput": forward_result["logitOutput"].numpy(),
+            "batchWeight": batch_weight.numpy(),
+            "gradNorm": float(grad_norm_value.numpy() if isinstance(grad_norm_value, tf.Tensor) else grad_norm_value),
+        }
+        return returnDict
 
     def _loadAllDatasets(self):
         """
@@ -889,18 +834,7 @@ class charSeqRNN(object):
         self, inputs, targets, errWeight, numBinsPerTrial, batchSize, addNoise=True
     ):
         """
-        This function creates a tensorflow 'dataset' from the real data given as input. Implements random
-        extraction of data snippets from the full sentences and the optional addition of training noise of various kinds.
-
-        Args:
-            inputs (tensor : B x T x N): A 3d tensor of RNN inputs with batch size B, time steps T, and number of input features N
-            targets (tensor : B x T x C): A 3d tensor of RNN targets with batch size B, time steps T, and number of targets C
-            errWeight (tensor : B x T): A 2d tensor of error weights for each time step of data
-            numBinsPerTrial (tensor : B): A 1d tensor describing the true length of each sentence in the batch (data is zero-padded)
-            batchSize (int): Size of the mini-batch to construct
-
-        Returns:
-            iterator (tensorflow iterator): A dataset iterator that can be used to pull new minibatches
+        Creates a tf.data.Dataset from real data with optional noise augmentation.
         """
         newDataset = tf.data.Dataset.from_tensor_slices(
             (
@@ -911,7 +845,7 @@ class charSeqRNN(object):
             )
         )
 
-        newDataset = newDataset.apply(tf.data.experimental.shuffle_and_repeat(batchSize * 4))
+        newDataset = newDataset.shuffle(batchSize * 4).repeat()
 
         mapFun = (
             lambda inputs, targets, errWeight, numBinsPerTrial: extractSentenceSnippet(
@@ -923,7 +857,7 @@ class charSeqRNN(object):
                 self.args["directionality"],
             )
         )
-        newDataset = newDataset.map(mapFun)
+        newDataset = newDataset.map(mapFun, num_parallel_calls=tf.data.AUTOTUNE)
 
         if addNoise and (
             self.args["constantOffsetSD"] > 0 or self.args["randomWalkSD"] > 0
@@ -937,7 +871,7 @@ class charSeqRNN(object):
                 self.args["randomWalkSD"],
                 self.args["timeSteps"],
             )
-            newDataset = newDataset.map(mapFun)
+            newDataset = newDataset.map(mapFun, num_parallel_calls=tf.data.AUTOTUNE)
 
         if addNoise and self.args["whiteNoiseSD"] > 0:
             mapFun = lambda inputs, targets, errWeight, numBinsPerTrial: addWhiteNoise(
@@ -948,15 +882,12 @@ class charSeqRNN(object):
                 self.args["whiteNoiseSD"],
                 self.args["timeSteps"],
             )
-            newDataset = newDataset.map(mapFun)
+            newDataset = newDataset.map(mapFun, num_parallel_calls=tf.data.AUTOTUNE)
 
-        newDataset = newDataset.batch(batchSize)
-        newDataset = newDataset.prefetch(1)
+        newDataset = newDataset.batch(batchSize, drop_remainder=True)
+        newDataset = newDataset.prefetch(tf.data.AUTOTUNE)
 
-        iterator = tf.compat.v1.data.make_initializable_iterator(newDataset)
-        self.sess.run(iterator.initializer)
-
-        return iterator
+        return newDataset
 
 
 def extractSentenceSnippet(
@@ -975,7 +906,7 @@ def extractSentenceSnippet(
     inputsSnippet = inputs[randomStart : (randomStart + nSteps), :]
     targetsSnippet = targets[randomStart : (randomStart + nSteps), :]
 
-    charStarts = tf.compat.v2.where(targetsSnippet[1:, -1] - targetsSnippet[0:-1, -1] >= 0.1)
+    charStarts = tf.where(targetsSnippet[1:, -1] - targetsSnippet[0:-1, -1] >= 0.1)
 
     def noLetters():
         ews = tf.zeros(shape=[nSteps])
@@ -1096,35 +1027,30 @@ def _prepare_initial_state(initRNNState, nBatch, nUnits, direction):
     if initRNNState is None:
         return None
 
-    # Validate shape of initRNNState from original context: (num_layers, nBatch, nUnits)
-    if (
-        len(initRNNState.shape) != 3
-        or initRNNState.shape[1] != nBatch
-        or initRNNState.shape[2] != nUnits
-    ):
+    if len(initRNNState.shape) != 3:
         raise ValueError(
             f"initRNNState has an unexpected shape: {initRNNState.shape}. "
-            f"Expected (num_layers, nBatch, nUnits) like (1, {nBatch}, {nUnits})."
+            f"Expected (num_layers, batch, nUnits)."
         )
 
-    if initRNNState.shape[0] == 1:
-        single_layer_state = initRNNState[
-            0
-        ]  # Squeeze num_layers dimension: (nBatch, nUnits)
-        if direction == "bidirectional":
-            # For Bidirectional, Keras expects [forward_state, backward_state].
-            # Assuming the single provided state is for the forward direction,
-            # and the backward direction is zero-initialized.
-            backward_state = tf.zeros_like(single_layer_state)
-            return [single_layer_state, backward_state]
-        else:
-            return single_layer_state
-    else:
-        # If initRNNState has more than 1 layer, it's incompatible with a "SingleLayer" function.
+    if initRNNState.shape[2] not in (nUnits, None):
         raise ValueError(
-            f"initRNNState has {initRNNState.shape[0]} layers, but this function is for a single layer. "
-            f"Expected initRNNState.shape[0] == 1 for single-layer GRU."
+            f"initRNNState has an unexpected unit dimension: {initRNNState.shape[2]} "
+            f"instead of {nUnits}."
         )
+
+    if initRNNState.shape[1] != nBatch:
+        initRNNState = tf.tile(initRNNState, [1, nBatch, 1])
+
+    if direction == "bidirectional":
+        backward_state = (
+            initRNNState[1]
+            if initRNNState.shape[0] > 1
+            else tf.zeros_like(initRNNState[0])
+        )
+        return [initRNNState[0], backward_state]
+
+    return initRNNState[0]
 
 
 def cudnnGraphSingleLayer(
@@ -1168,7 +1094,7 @@ def cudnnGraphSingleLayer(
     )
 
     # Bias initializer: tf.constant_initializer(0.0) is equivalent to Zeros()
-    bias_initializer = tf.compat.v1.keras.initializers.Zeros()
+    bias_initializer = tf.keras.initializers.Zeros()
 
     if direction == "forward":
         gru_layer = tf.keras.layers.GRU(
