@@ -1204,7 +1204,7 @@ def cudnnGraphSingleLayer(
         outputs, final_state = gru_layer(batchInputs, initial_state=prepared_init_state)
 
         y_cudnn = outputs
-        trainable_weights = [gru_layer.kernel, gru_layer.recurrent_kernel]
+        trainable_weights = [gru_layer.cell.kernel, gru_layer.cell.recurrent_kernel]
 
     elif direction == "bidirectional":
         # For Bidirectional, initial_state needs [forward_state, backward_state].
