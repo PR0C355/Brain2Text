@@ -842,6 +842,7 @@ class charSeqRNN(object):
         }
         return returnDict
 
+    @tf.function
     def _runBatch_distributed(
         self,
         batch_inputs,
