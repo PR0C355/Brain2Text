@@ -352,7 +352,7 @@ class charSeqRNN(object):
             totalErr = tf.reduce_mean(per_example_total)
         else:
             totalErr = tf.nn.compute_average_loss(
-                per_example_total, global_batch_size=tf.cast(global_batch_size, tf.float32)
+                per_example_total, global_batch_size=tf.cast(global_batch_size, tf.int32)
             )
 
         l2cost = tf.constant(0.0, dtype=tf.float32)
@@ -1546,6 +1546,26 @@ if __name__ == "__main__":
     args = parser.parse_args()
     args = vars(args)
     argDict = pickle.load(open(args["argsFile"], "rb"))
+
+    pid = os.getpid()
+    parent_pid = os.getppid()
+    print(
+        "charSeqRnnMigrate starting with PID "
+        + str(pid)
+        + " (parent PID "
+        + str(parent_pid)
+        + "). If launched from 04-Train.py, the training process runs in the background "
+        + "and will keep running after a Ctrl+C in the launcher. Use this PID to stop it explicitly if needed."
+    )
+
+    pid_file = os.path.join(argDict["outputDir"], "charSeqRnn.pid")
+    try:
+        os.makedirs(argDict["outputDir"], exist_ok=True)
+        with open(pid_file, "w") as pf:
+            pf.write(str(pid))
+        print("Recorded training PID at " + pid_file)
+    except Exception as exc:
+        print("Warning: could not write PID file (" + str(exc) + ")")
 
     # set the visible device to the gpu specified in 'args' (otherwise tensorflow will steal all the GPUs)
     os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
