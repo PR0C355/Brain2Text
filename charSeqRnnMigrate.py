@@ -11,6 +11,7 @@ import pickle
 from dataPreprocessing import prepareDataCubesForRNN
 import sys
 
+
 class charSeqRNN(object):
     """
     This class encapsulates all the functionality needed for training, loading and running the handwriting decoder RNN.
@@ -167,9 +168,7 @@ class charSeqRNN(object):
         # Build layers so weights exist for checkpointing and L2 collection.
         dummy_batch = tf.zeros([1, 1, nInputs], dtype=tf.float32)
         self.layer1(dummy_batch, initial_state=self._initial_state(1), training=False)
-        dummy_top = tf.zeros(
-            [1, 1, self.args["nUnits"] * biDir], dtype=tf.float32
-        )
+        dummy_top = tf.zeros([1, 1, self.args["nUnits"] * biDir], dtype=tf.float32)
         self.layer2(dummy_top, initial_state=self._initial_state(1), training=False)
 
         self.readout_W = tf.Variable(
@@ -308,15 +307,15 @@ class charSeqRNN(object):
     def _concat_per_replica(self, distributed_tensor, axis=0):
         if not self.use_strategy:
             return distributed_tensor
-        return tf.concat(self.strategy.experimental_local_results(distributed_tensor), axis=axis)
+        return tf.concat(
+            self.strategy.experimental_local_results(distributed_tensor), axis=axis
+        )
 
     def _forward_and_loss(
         self, batch_inputs, batch_targets, batch_weight, day_num, global_batch_size=None
     ):
         inp_W, inp_b = self._input_layer_for_day(day_num)
-        tiled_W = tf.tile(
-            tf.expand_dims(inp_W, 0), [tf.shape(batch_inputs)[0], 1, 1]
-        )
+        tiled_W = tf.tile(tf.expand_dims(inp_W, 0), [tf.shape(batch_inputs)[0], 1, 1])
         inputFactors = tf.matmul(batch_inputs, tiled_W) + inp_b
         inputFeatures = inputFactors
         if self.args["smoothInputs"] == 1:
@@ -334,7 +333,9 @@ class charSeqRNN(object):
         tiledReadoutWeights = tf.tile(
             tf.expand_dims(self.readout_W, 0), [tf.shape(batch_inputs)[0], 1, 1]
         )
-        logitOutput_downsample = tf.matmul(rnn_output2, tiledReadoutWeights) + self.readout_b
+        logitOutput_downsample = (
+            tf.matmul(rnn_output2, tiledReadoutWeights) + self.readout_b
+        )
         logitOutput = tf.gather(logitOutput_downsample, self.expIdx, axis=1)
 
         if self.args["outputDelay"] > 0:
@@ -368,7 +369,8 @@ class charSeqRNN(object):
             totalErr = tf.reduce_mean(per_example_total)
         else:
             totalErr = tf.nn.compute_average_loss(
-                per_example_total, global_batch_size=tf.cast(global_batch_size, tf.int32)
+                per_example_total,
+                global_batch_size=tf.cast(global_batch_size, tf.int32),
             )
 
         l2cost = tf.constant(0.0, dtype=tf.float32)
@@ -487,9 +489,7 @@ class charSeqRNN(object):
         newDataset = tf.data.TFRecordDataset(record_files)
         newDataset = newDataset.map(mapFnc, num_parallel_calls=tf.data.AUTOTUNE)
         newDataset = newDataset.shuffle(4).repeat()
-        newDataset = newDataset.batch(
-            self.args["synthBatchSize"], drop_remainder=True
-        )
+        newDataset = newDataset.batch(self.args["synthBatchSize"], drop_remainder=True)
         newDataset = newDataset.prefetch(tf.data.AUTOTUNE)
         return newDataset
 
@@ -810,7 +810,9 @@ class charSeqRNN(object):
             should_distribute = (static_batch % self.strategy.num_replicas_in_sync) == 0
         elif should_distribute:
             dynamic_batch = int(tf.shape(batch_inputs)[0].numpy())
-            should_distribute = (dynamic_batch % self.strategy.num_replicas_in_sync) == 0
+            should_distribute = (
+                dynamic_batch % self.strategy.num_replicas_in_sync
+            ) == 0
 
         if should_distribute:
             return self._runBatch_distributed(
@@ -854,10 +856,13 @@ class charSeqRNN(object):
             "targets": batch_targets.numpy(),
             "logitOutput": forward_result["logitOutput"].numpy(),
             "batchWeight": batch_weight.numpy(),
-            "gradNorm": float(grad_norm_value.numpy() if isinstance(grad_norm_value, tf.Tensor) else grad_norm_value),
+            "gradNorm": float(
+                grad_norm_value.numpy()
+                if isinstance(grad_norm_value, tf.Tensor)
+                else grad_norm_value
+            ),
         }
         return returnDict
-
 
     def _runBatch_distributed(
         self,
@@ -999,9 +1004,7 @@ class charSeqRNN(object):
             per_replica_grad_norm,
             per_replica_targets,
             per_replica_weight,
-        ) = self.strategy.run(
-            step_fn, args=(dist_inputs, dist_targets, dist_weight)
-        )
+        ) = self.strategy.run(step_fn, args=(dist_inputs, dist_targets, dist_weight))
 
         total_err = self.strategy.reduce(
             tf.distribute.ReduceOp.SUM, per_replica_err, axis=None
