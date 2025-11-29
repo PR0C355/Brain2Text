@@ -25,6 +25,7 @@ class charSeqRNN(object):
         (charSeqRNN.train) or infer (charSeqRNN.inference).
         """
         self.args = args
+        self._compiled_distributed_step = None
 
         load_checkpoints = self._list_checkpoint_paths(self.args["loadDir"])
         has_load_ckpt = len(load_checkpoints) > 0
@@ -89,6 +90,7 @@ class charSeqRNN(object):
             )
 
         self.dayToLayerMap = eval(self.args["dayToLayerMap"])
+        self.dayToLayerMapTensor = tf.constant(self.dayToLayerMap, dtype=tf.int32)
         self.dayProbability = np.array(eval(self.args["dayProbability"]))
         self.nInpLayers = len(np.unique(self.dayToLayerMap))
         self.is_bidirectional = self.args["directionality"] == "bidirectional"
@@ -119,8 +121,16 @@ class charSeqRNN(object):
         Create a distribution strategy. If multiple GPUs are visible, use MirroredStrategy to
         replicate the model across them; otherwise fall back to the default strategy.
         """
-        gpus = tf.config.list_logical_devices("GPU")
-        if len(gpus) > 1:
+        physical_gpus = tf.config.list_physical_devices("GPU")
+        if physical_gpus:
+            try:
+                for gpu in physical_gpus:
+                    tf.config.experimental.set_memory_growth(gpu, True)
+            except Exception as exc:  # pragma: no cover - defensive logging
+                print("Could not enable memory growth: {}".format(exc))
+
+        logical_gpus = tf.config.list_logical_devices("GPU")
+        if len(logical_gpus) > 1:
             return tf.distribute.MirroredStrategy()
         return tf.distribute.get_strategy()
 
@@ -230,6 +240,12 @@ class charSeqRNN(object):
         return tiled_state[0]
 
     def _input_layer_for_day(self, dayNum):
+        if tf.is_tensor(dayNum):
+            layer_idx = tf.gather(self.dayToLayerMapTensor, dayNum)
+            stacked_W = tf.stack(self.inputFactors_W_all, axis=0)
+            stacked_b = tf.stack(self.inputFactors_b_all, axis=0)
+            return tf.gather(stacked_W, layer_idx), tf.gather(stacked_b, layer_idx)
+
         layer_idx = self.dayToLayerMap[dayNum]
         return self.inputFactors_W_all[layer_idx], self.inputFactors_b_all[layer_idx]
 
@@ -842,7 +858,7 @@ class charSeqRNN(object):
         }
         return returnDict
 
-    @tf.function
+
     def _runBatch_distributed(
         self,
         batch_inputs,
@@ -855,23 +871,72 @@ class charSeqRNN(object):
         """
         Distributed minibatch execution across multiple GPUs using MirroredStrategy.
         """
+        if self._compiled_distributed_step is None:
+            self._compiled_distributed_step = tf.function(
+                self._distributed_step, experimental_relax_shapes=True
+            )
+
+        (
+            total_err,
+            logitOutput,
+            rnnOutput,
+            inputFeatures,
+            grad_norm_value,
+            targets,
+            batchWeight,
+        ) = self._compiled_distributed_step(
+            batch_inputs,
+            batch_targets,
+            batch_weight,
+            tf.convert_to_tensor(dayNum, dtype=tf.int32),
+            tf.convert_to_tensor(computeGradient),
+            tf.convert_to_tensor(doGradientUpdate),
+        )
+
+        return {
+            "err": total_err.numpy(),
+            "inputFeatures": inputFeatures.numpy(),
+            "output": rnnOutput.numpy(),
+            "targets": targets.numpy(),
+            "logitOutput": logitOutput.numpy(),
+            "batchWeight": batchWeight.numpy(),
+            "gradNorm": float(grad_norm_value.numpy()),
+        }
+
+    def _distributed_step(
+        self,
+        batch_inputs,
+        batch_targets,
+        batch_weight,
+        day_num,
+        compute_gradient,
+        do_gradient_update,
+    ):
+        """
+        Graph-compiled training/inference step executed across replicas.
+        Wrapping `strategy.run` in `tf.function` avoids eager overhead warnings
+        and ensures correct multi-GPU execution.
+        """
         global_batch_size = tf.shape(batch_inputs)[0]
 
         dist_inputs = self._distribute_batch(batch_inputs)
         dist_targets = self._distribute_batch(batch_targets)
         dist_weight = self._distribute_batch(batch_weight)
 
+        day_num = tf.cast(day_num, tf.int32)
+        compute_gradient = tf.convert_to_tensor(compute_gradient)
+        do_gradient_update = tf.convert_to_tensor(do_gradient_update)
+
         def step_fn(replica_inputs, replica_targets, replica_weight):
-            local_grad_norm = tf.constant(0.0, dtype=tf.float32)
             trainable_vars = self._trainable_variables()
 
-            if computeGradient:
+            def run_with_grads():
                 with tf.GradientTape() as tape:
                     forward_result = self._forward_and_loss(
                         replica_inputs,
                         replica_targets,
                         replica_weight,
-                        dayNum,
+                        day_num,
                         global_batch_size,
                     )
 
@@ -881,27 +946,47 @@ class charSeqRNN(object):
                     for g, v in zip(grads, trainable_vars)
                 ]
 
-                if len(safe_grads) > 0:
-                    local_grad_norm = tf.linalg.global_norm(safe_grads)
-                    clipped_grads, _ = tf.clip_by_global_norm(safe_grads, 10.0)
-                    clipped_pairs = list(zip(clipped_grads, trainable_vars))
-                    if doGradientUpdate:
-                        self.optimizer.apply_gradients(clipped_pairs)
-            else:
+                grad_norm_local = (
+                    tf.linalg.global_norm(safe_grads)
+                    if len(safe_grads) > 0
+                    else tf.constant(0.0, dtype=tf.float32)
+                )
+
+                clipped_grads, _ = tf.clip_by_global_norm(safe_grads, 10.0)
+                clipped_pairs = list(zip(clipped_grads, trainable_vars))
+
+                def apply_update():
+                    self.optimizer.apply_gradients(clipped_pairs)
+                    return tf.constant(0.0, dtype=tf.float32)
+
+                tf.cond(
+                    do_gradient_update,
+                    apply_update,
+                    lambda: tf.constant(0.0, dtype=tf.float32),
+                )
+
+                return forward_result, grad_norm_local
+
+            def forward_only():
                 forward_result = self._forward_and_loss(
                     replica_inputs,
                     replica_targets,
                     replica_weight,
-                    dayNum,
+                    day_num,
                     global_batch_size,
                 )
+                return forward_result, tf.constant(0.0, dtype=tf.float32)
+
+            forward_result, grad_norm_local = tf.cond(
+                compute_gradient, run_with_grads, forward_only
+            )
 
             return (
                 forward_result["total_err"],
                 forward_result["logitOutput"],
                 forward_result["rnnOutput"],
                 forward_result["inputFeatures"],
-                local_grad_norm,
+                grad_norm_local,
                 replica_targets,
                 replica_weight,
             )
@@ -931,15 +1016,15 @@ class charSeqRNN(object):
         targets = self._concat_per_replica(per_replica_targets)
         batchWeight = self._concat_per_replica(per_replica_weight)
 
-        return {
-            "err": total_err.numpy(),
-            "inputFeatures": inputFeatures.numpy(),
-            "output": rnnOutput.numpy(),
-            "targets": targets.numpy(),
-            "logitOutput": logitOutput.numpy(),
-            "batchWeight": batchWeight.numpy(),
-            "gradNorm": float(grad_norm_value.numpy()),
-        }
+        return (
+            total_err,
+            logitOutput,
+            rnnOutput,
+            inputFeatures,
+            grad_norm_value,
+            targets,
+            batchWeight,
+        )
 
     def _loadAllDatasets(self):
         """
