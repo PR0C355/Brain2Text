@@ -3,9 +3,10 @@
 #SBATCH --output=/mnt/arc/oguntola/Brain2Text/logs/%x-%j.log
 #SBATCH --error=/mnt/arc/oguntola/Brain2Text/logs/%x-%j.log
 #SBATCH --time=1-00:00:00
-#SBATCH --cpus-per-task=100
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=4
 #SBATCH --partition=a6000
-#SBATCH --gres=gpu:8
+#SBATCH --gres=gpu:1
 
 cd /mnt/arc/oguntola/Brain2Text/
 source .venv/bin/activate
@@ -23,4 +24,6 @@ fi
 
 echo "Running on $(hostname) at $(date)"
 
-python 04-Train.py --gpu 4
+echo $CUDA_VISIBLE_DEVICES
+
+python 04-Train.py --gpu $CUDA_VISIBLE_DEVICES --logdir $SLURM_JOB_ID

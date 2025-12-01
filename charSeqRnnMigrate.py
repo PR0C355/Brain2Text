@@ -5,9 +5,10 @@ import tensorflow as tf
 import random
 import numpy as np
 import scipy.io
-from scipy.filters import gaussian_filter1d
+from scipy.ndimage.filters import gaussian_filter1d
 import scipy.special
 import pickle
+import mlflow
 
 from tqdm import tqdm
 from dataPreprocessing import prepareDataCubesForRNN
@@ -471,6 +472,7 @@ class charSeqRNN(object):
             batchValStats = resumedStats["batchValStats"]
 
         # Save initial model parameters.
+        mlflow.log_param("initial_model_parameters", self.args["outputDir"] + "/model.ckpt")
         saver.save(
             self.sess,
             self.args["outputDir"] + "/model.ckpt",
@@ -524,7 +526,16 @@ class charSeqRNN(object):
                 dayNum,
             ]
 
-            # every once in a while, run a validation batch (i.e., run the RNN on the test partition to see how we're doing)
+            # Log training metrics to MLflow periodically
+            if i % self.args["batchesPerVal"] == 0:
+                mlflow.log_metrics({
+                    "train_error": float(runResultsTrain["err"]),
+                    "train_accuracy": float(trainAcc),
+                    "gradient_norm": float(runResultsTrain["gradNorm"]),
+                    "learning_rate": float(lr),
+                    "batch_time_seconds": float(totalSeconds)
+                }, step=i)
+
             if i % self.args["batchesPerVal"] == 0:
                 valSetIdx = int(i / self.args["batchesPerVal"])
                 batchValStats[valSetIdx, 0:4], outputSnapshot = (
@@ -583,6 +594,29 @@ class charSeqRNN(object):
             global_step=i,
             write_meta_graph=False,
         )
+        
+        # Log final summary metrics to MLflow
+        # Calculate final averages from the last 10% of training
+        final_window = max(1, int(0.1 * self.args["nBatchesToTrain"]))
+        final_train_error = np.mean(batchTrainStats[-final_window:, 1])
+        final_train_accuracy = np.mean(batchTrainStats[-final_window:, 3])
+        
+        # Get final validation metrics if available
+        if len(batchValStats) > 0:
+            final_val_error = batchValStats[-1, 1]
+            final_val_accuracy = batchValStats[-1, 3]
+            
+            mlflow.log_metrics({
+                "final_train_error": float(final_train_error),
+                "final_train_accuracy": float(final_train_accuracy),
+                "final_val_error": float(final_val_error),
+                "final_val_accuracy": float(final_val_accuracy)
+            })
+        else:
+            mlflow.log_metrics({
+                "final_train_error": float(final_train_error),
+                "final_train_accuracy": float(final_train_accuracy)
+            })
 
     def inference(self):
         """
@@ -671,6 +705,7 @@ class charSeqRNN(object):
             self.args["outputDelay"],
         )
 
+
         print(
             "Val Batch: "
             + str(i)
@@ -691,6 +726,13 @@ class charSeqRNN(object):
             + ", time: "
             + str(totalSeconds)
         )
+
+        # Log validation metrics to MLflow
+        mlflow.log_metrics({
+            "val_error": float(runResults["err"]),
+            "val_accuracy": float(valAcc),
+            "val_gradient_norm": float(runResults["gradNorm"])
+        }, step=i)
 
         outputSnapshot = {}
         outputSnapshot["inputs"] = runResults["inputFeatures"][0, :, :]
@@ -1449,6 +1491,7 @@ def getDefaultRNNArgs():
 # The only command line argument is the name of an args file.
 # Launching from the command line is more reliable than launching from within a jupyter notebook, which sometimes hangs.
 if __name__ == "__main__":
+    
     parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
@@ -1463,11 +1506,25 @@ if __name__ == "__main__":
     print("Setting CUDA_VISIBLE_DEVICES to " + argDict["gpuNumber"])
     os.environ["CUDA_VISIBLE_DEVICES"] = argDict["gpuNumber"]
 
+    mlflow.set_tracking_uri("https://mission.tumi.dev/mlflow/")
+    
     # instantiate the RNN model
     rnnModel = charSeqRNN(args=argDict)
 
     # train or infer
-    if argDict["mode"] == "train":
-        rnnModel.train()
-    elif argDict["mode"] == "inference":
-        rnnModel.inference()
+    with mlflow.start_run(log_system_metrics=True):
+        # Log parameters - filter to only include serializable values
+        params_to_log = {}
+        for key, value in argDict.items():
+            # Convert value to string if it's not a simple type
+            if isinstance(value, (int, float, str, bool)):
+                params_to_log[key] = value
+            else:
+                params_to_log[key] = str(value)
+        
+        mlflow.log_params(params_to_log)
+        
+        if argDict["mode"] == "train":
+            rnnModel.train()
+        elif argDict["mode"] == "inference":
+            rnnModel.inference()
