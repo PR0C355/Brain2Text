@@ -5,6 +5,7 @@
 
 
 import numpy as np
+import argparse
 import scipy.io
 import scipy.ndimage.filters
 import os
@@ -12,7 +13,7 @@ import matplotlib
 import matplotlib.pyplot as plt
 import pickle
 from datetime import datetime
-from charSeqRnnMigrate import charSeqRNN, getDefaultRNNArgs
+from charSeqRnnMigrate import getDefaultRNNArgs
 
 # point this towards the top level dataset directory
 rootDir = os.path.expanduser(".") + "/backupBCIData/"
@@ -43,7 +44,10 @@ if not os.path.isdir(rootDir + "RNNTrainingSteps/Step4_RNNTraining"):
 
 
 # We will use the default arguments specified here
+parser = argparse.ArgumentParser(description='Training script for RNN.')
+parser.add_argument('--gpu', type=str, default='0', help='GPU number to use.')
 args = getDefaultRNNArgs()
+args["gpuNumber"] = parser.parse_args().gpu
 
 # Configure the arguments for a multi-day RNN (that will have a unique input layer for each day)
 for x in range(len(dataDirs)):
@@ -74,7 +78,7 @@ for x in range(len(dataDirs)):
     )
     args["sessionName_" + str(x)] = dataDirs[x]
 
-args["outputDir"] = rootDir + "RNNTrainingSteps/Step4_RNNTraining/" + rnnOutputDir
+args["outputDir"] = rootDir + "RNNTrainingSteps/Step4_RNNTraining/" + rnnOutputDir + "/" + datetime.now().strftime("%Y%m%d_%H%M%S")
 if not os.path.isdir(args["outputDir"]):
     os.mkdir(args["outputDir"])
 
