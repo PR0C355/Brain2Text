@@ -45,8 +45,10 @@ if not os.path.isdir(rootDir + "RNNTrainingSteps/Step4_RNNTraining"):
 parser = argparse.ArgumentParser(description='Training script for RNN.')
 parser.add_argument('--gpu', type=str, default='0', help='GPU number to use.')
 parser.add_argument('--logdir', type=str, default='', help='Directory for logs.')
+
+parsed_args = parser.parse_args()
 args = getDefaultRNNArgs()
-args["gpuNumber"] = parser.parse_args().gpu
+args["gpuNumber"] = parsed_args.gpu
 
 # Configure the arguments for a multi-day RNN (that will have a unique input layer for each day)
 for x in range(len(dataDirs)):
@@ -91,11 +93,12 @@ pickle.dump(args, open(args["outputDir"] + "/args.p", "wb"))
 
 # The following code snippet will launch an RNN training program in a separate python kernel (so it doesn't launch inside
 # the jupyter notebook, which can be unstable).
+import subprocess
 import os
 
 argsFile = args["outputDir"] + "/args.p"
 scriptFile = os.getcwd() + "/charSeqRnnMigrate.py"
-os.system("python3 " + scriptFile + " --argsFile=" + argsFile + " &")
+process = subprocess.Popen(["python3", scriptFile, "--argsFile=" + argsFile])
 
 
 # Run this cell to visualize the training process in real-time. You can stop it at any time without interrupting the
@@ -104,12 +107,20 @@ import time
 from IPython import display
 from scipy.ndimage.filters import gaussian_filter1d
 
-while True:
+while process.poll() is None: # Continue as long as the subprocess is running
     # The RNN training process periodically saves off performance statistics and a snapshot of RNN outputs, which we load here.
+    snapshot_path = args["outputDir"] + "/outputSnapshot.mat"
+    intOut_path = args["outputDir"] + "/intermediateOutput.mat"
+
+    if not os.path.exists(snapshot_path) or not os.path.exists(intOut_path):
+        time.sleep(30)
+        continue
+
     try:
-        snapshot = scipy.io.loadmat(args["outputDir"] + "/outputSnapshot.mat")
-        intOut = scipy.io.loadmat(args["outputDir"] + "/intermediateOutput.mat")
-    except:
+        snapshot = scipy.io.loadmat(snapshot_path)
+        intOut = scipy.io.loadmat(intOut_path)
+    except Exception as e:
+        print(f"Error loading .mat files: {e}")
         time.sleep(30)
         continue
 
