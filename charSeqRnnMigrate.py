@@ -1,4 +1,3 @@
-import argparse
 import os
 from datetime import datetime
 import tensorflow as tf
@@ -7,7 +6,6 @@ import numpy as np
 import scipy.io
 from scipy.ndimage.filters import gaussian_filter1d
 import scipy.special
-import pickle
 import mlflow
 import matplotlib
 matplotlib.use('Agg')  # Use non-interactive backend for server environments
@@ -39,7 +37,7 @@ class charSeqRNN(object):
         if self.args["mode"] == "train":
             self.isTraining = True
             ckpt = tf.train.get_checkpoint_state(self.args["loadDir"])
-            if ckpt == None:
+            if ckpt is None:
                 # Nothing to load (no checkpoint found here), so we won't resume or try to load anything
                 self.loadingInitParams = False
                 self.resumeTraining = False

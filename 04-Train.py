@@ -4,13 +4,8 @@
 # and plotting them here, so you can watch how it learns over time.
 
 
-import numpy as np
 import argparse
-import scipy.io
-import scipy.ndimage.filters
 import os
-import matplotlib.pyplot as plt
-import pickle
 from charSeqRnnMigrate import getDefaultRNNArgs
 
 # point this towards the top level dataset directory
@@ -79,7 +74,7 @@ for x in range(len(dataDirs)):
     )
     args["sessionName_" + str(x)] = dataDirs[x]
 
-args["outputDir"] = rootDir + "RNNTrainingSteps/Step4_RNNTraining/" + rnnOutputDir + "/" + parser.parse_args().logdir
+args["outputDir"] = rootDir + "RNNTrainingSteps/Step4_RNNTraining/" + rnnOutputDir + "/" + parsed_args.logdir
 if not os.path.isdir(args["outputDir"]):
     os.mkdir(args["outputDir"])
 
