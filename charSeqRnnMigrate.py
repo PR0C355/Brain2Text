@@ -1,4 +1,3 @@
-import argparse
 import os
 from datetime import datetime
 import tensorflow as tf
@@ -7,10 +6,16 @@ import numpy as np
 import scipy.io
 from scipy.ndimage.filters import gaussian_filter1d
 import scipy.special
-import pickle
+import mlflow
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend for server environments
+import matplotlib.pyplot as plt
+
+from tqdm import tqdm
 from dataPreprocessing import prepareDataCubesForRNN
 import sys
 
+tf.compat.v1.disable_eager_execution()
 
 class charSeqRNN(object):
     """
@@ -32,7 +37,7 @@ class charSeqRNN(object):
         if self.args["mode"] == "train":
             self.isTraining = True
             ckpt = tf.train.get_checkpoint_state(self.args["loadDir"])
-            if ckpt == None:
+            if ckpt is None:
                 # Nothing to load (no checkpoint found here), so we won't resume or try to load anything
                 self.loadingInitParams = False
                 self.resumeTraining = False
@@ -175,7 +180,7 @@ class charSeqRNN(object):
             newDataset = newDataset.repeat()
             newDataset = newDataset.batch(self.args["batchSize"])
 
-            iterator = newDataset.make_initializable_iterator()
+            iterator = tf.compat.v1.data.make_initializable_iterator(newDataset)
             self.sess.run(iterator.initializer)
 
             allRealIterators.append(iterator)
@@ -186,8 +191,8 @@ class charSeqRNN(object):
         # days for each minibatch. As part of this, we also have to combine the real data and synthetic data into a single minibatch.
         # Note that 'dayNum' selects between the days of data, while 'datasetNum' also selects between train vs. test datasets.
         # Even datasetNums are training datasets and odd datasetNums are validation datasets.
-        self.datasetNumPH = tf.placeholder(tf.int32, shape=[])
-        self.dayNumPH = tf.placeholder(tf.int32, shape=[])
+        self.datasetNumPH = tf.compat.v1.placeholder(tf.int32, shape=[])
+        self.dayNumPH = tf.compat.v1.placeholder(tf.int32, shape=[])
 
         def pruneValDataset(valIter):
             inp, targ, weight, bins = valIter.get_next()
@@ -249,11 +254,11 @@ class charSeqRNN(object):
         else:
             biDir = 1
 
-        self.rnnStartState = tf.get_variable(
+        self.rnnStartState = tf.compat.v1.get_variable(
             "RNN_layer0/startState",
             [biDir, 1, self.args["nUnits"]],
             dtype=tf.float32,
-            initializer=tf.zeros_initializer,
+            initializer=tf.compat.v1.zeros_initializer,
             trainable=bool(self.args["trainableBackEnd"]),
         )
 
@@ -269,7 +274,7 @@ class charSeqRNN(object):
         self.inputFactors_b_all = []
         for inpLayerIdx in range(self.nInpLayers):
             self.inputFactors_W_all.append(
-                tf.get_variable(
+                tf.compat.v1.get_variable(
                     "inputFactors_W_" + str(inpLayerIdx),
                     initializer=np.identity(nInputs).astype(np.float32),
                     trainable=bool(self.args["trainableInput"]),
@@ -277,7 +282,7 @@ class charSeqRNN(object):
             )
 
             self.inputFactors_b_all.append(
-                tf.get_variable(
+                tf.compat.v1.get_variable(
                     "inputFactors_b_" + str(inpLayerIdx),
                     initializer=np.zeros([nInputs]).astype(np.float32),
                     trainable=bool(self.args["trainableInput"]),
@@ -323,7 +328,7 @@ class charSeqRNN(object):
         nSkipInputs = self.args["nUnits"]
         skipLen = self.args["skipLen"]
 
-        with tf.variable_scope("layer2"):
+        with tf.compat.v1.variable_scope("layer2"):
             self.rnnOutput2, self.rnnWeightVars2 = cudnnGraphSingleLayer(
                 self.args["nUnits"],
                 initRNNState,
@@ -335,17 +340,17 @@ class charSeqRNN(object):
             )
 
         # Finally, define the linear readout layer.
-        self.readout_W = tf.get_variable(
+        self.readout_W = tf.compat.v1.get_variable(
             "readout_W",
             shape=[biDir * self.args["nUnits"], nOutputs],
-            initializer=tf.random_normal_initializer(dtype=tf.float32, stddev=0.05),
+            initializer=tf.compat.v1.random_normal_initializer(dtype=tf.float32, stddev=0.05),
             trainable=bool(self.args["trainableBackEnd"]),
         )
 
-        self.readout_b = tf.get_variable(
+        self.readout_b = tf.compat.v1.get_variable(
             "readout_b",
             shape=[nOutputs],
-            initializer=tf.zeros_initializer(dtype=tf.float32),
+            initializer=tf.compat.v1.zeros_initializer(dtype=tf.float32),
             trainable=bool(self.args["trainableBackEnd"]),
         )
 
@@ -377,7 +382,7 @@ class charSeqRNN(object):
         labels = labels[:, :, 0:-1]
 
         # cross-entropy character probability loss
-        ceLoss = tf.nn.softmax_cross_entropy_with_logits_v2(
+        ceLoss = tf.nn.softmax_cross_entropy_with_logits(
             labels=labels, logits=logits
         )
         self.totalErr = tf.reduce_mean(
@@ -408,7 +413,7 @@ class charSeqRNN(object):
 
         # --------------Gradient descent--------------
         # prepare gradients and optimizer
-        tvars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES)
+        tvars = tf.compat.v1.get_collection(tf.compat.v1.GraphKeys.TRAINABLE_VARIABLES)
 
         # option to only allow the input layers to train
         if not bool(self.args["trainableBackEnd"]):
@@ -420,24 +425,24 @@ class charSeqRNN(object):
         grads, self.grad_global_norm = tf.clip_by_global_norm(grads, 10)
 
         # optimization routine & learning rate
-        learnRate = tf.get_variable(
+        learnRate = tf.compat.v1.get_variable(
             "learnRate", dtype=tf.float32, initializer=1.0, trainable=False
         )
-        opt = tf.train.AdamOptimizer(learnRate, beta1=0.9, beta2=0.999, epsilon=1e-01)
+        opt = tf.compat.v1.train.AdamOptimizer(learnRate, beta1=0.9, beta2=0.999, epsilon=1e-01)
 
-        self.new_lr = tf.placeholder(tf.float32, shape=[], name="new_learning_rate")
-        self.lr_update = tf.assign(learnRate, self.new_lr)
+        self.new_lr = tf.compat.v1.placeholder(tf.float32, shape=[], name="new_learning_rate")
+        self.lr_update = tf.compat.v1.assign(learnRate, self.new_lr)
 
         # check if gradients are finite; if not, don't apply
         allIsFinite = []
         for g in grads:
             if g != None:
-                allIsFinite.append(tf.reduce_all(tf.is_finite(g)))
+                allIsFinite.append(tf.reduce_all(tf.math.is_finite(g)))
         gradIsFinite = tf.reduce_all(tf.stack(allIsFinite))
         self.train_op = tf.cond(
             gradIsFinite,
             lambda: opt.apply_gradients(
-                zip(grads, tvars), global_step=tf.train.get_or_create_global_step()
+                zip(grads, tvars), global_step=tf.compat.v1.train.get_or_create_global_step()
             ),
             lambda: tf.no_op(),
         )
@@ -450,7 +455,7 @@ class charSeqRNN(object):
         The main training loop, which we have implemented manually here. Each loop makes a single call to sess.run to execute
         one minibatch. ALong the way, we periodically save the model and performance statistics.
         """
-        saver = tf.train.Saver(max_to_keep=self.args["nCheckToKeep"])
+        saver = tf.compat.v1.train.Saver(max_to_keep=self.args["nCheckToKeep"])
 
         # Prepare to save performance data from each batch.
         batchTrainStats = np.zeros([self.args["nBatchesToTrain"], 6])
@@ -467,7 +472,13 @@ class charSeqRNN(object):
             batchTrainStats = resumedStats["batchTrainStats"]
             batchValStats = resumedStats["batchValStats"]
 
+        # Create figures directory if it doesn't exist
+        figures_dir = os.path.join(self.args["outputDir"], "figures")
+        if not os.path.exists(figures_dir):
+            os.makedirs(figures_dir)
+        
         # Save initial model parameters.
+        mlflow.log_param("initial_model_parameters", self.args["outputDir"] + "/model.ckpt")
         saver.save(
             self.sess,
             self.args["outputDir"] + "/model.ckpt",
@@ -478,6 +489,7 @@ class charSeqRNN(object):
         # This ensures we aren't accidentally changing the graph as we go (which degrades performance).
         self.sess.graph.finalize()
 
+        pbar = tqdm(total = self.args["nBatchesToTrain"], initial = i, desc = 'Training Batches')
         while i < self.args["nBatchesToTrain"]:
             # time how long this batch takes
             dtStart = datetime.now()
@@ -520,7 +532,16 @@ class charSeqRNN(object):
                 dayNum,
             ]
 
-            # every once in a while, run a validation batch (i.e., run the RNN on the test partition to see how we're doing)
+            # Log training metrics to MLflow periodically
+            if i % self.args["batchesPerVal"] == 0:
+                mlflow.log_metrics({
+                    "train_error": float(runResultsTrain["err"]),
+                    "train_accuracy": float(trainAcc),
+                    "gradient_norm": float(runResultsTrain["gradNorm"]),
+                    "learning_rate": float(lr),
+                    "batch_time_seconds": float(totalSeconds)
+                }, step=i)
+
             if i % self.args["batchesPerVal"] == 0:
                 valSetIdx = int(i / self.args["batchesPerVal"])
                 batchValStats[valSetIdx, 0:4], outputSnapshot = (
@@ -538,6 +559,8 @@ class charSeqRNN(object):
                 scipy.io.savemat(
                     self.args["outputDir"] + "/outputSnapshot", outputSnapshot
                 )
+                
+                pbar.update(self.args["batchesPerVal"])
 
             # save performance statistics and model parameters every so often
             if (
@@ -562,6 +585,7 @@ class charSeqRNN(object):
                 )
 
             i += 1
+        pbar.close()
 
         # save final training statistics over all batches & final model
         scipy.io.savemat(
@@ -576,6 +600,29 @@ class charSeqRNN(object):
             global_step=i,
             write_meta_graph=False,
         )
+        
+        # Log final summary metrics to MLflow
+        # Calculate final averages from the last 10% of training
+        final_window = max(1, int(0.1 * self.args["nBatchesToTrain"]))
+        final_train_error = np.mean(batchTrainStats[-final_window:, 1])
+        final_train_accuracy = np.mean(batchTrainStats[-final_window:, 3])
+        
+        # Get final validation metrics if available
+        if len(batchValStats) > 0:
+            final_val_error = batchValStats[-1, 1]
+            final_val_accuracy = batchValStats[-1, 3]
+            
+            mlflow.log_metrics({
+                "final_train_error": float(final_train_error),
+                "final_train_accuracy": float(final_train_accuracy),
+                "final_val_error": float(final_val_error),
+                "final_val_accuracy": float(final_val_accuracy)
+            })
+        else:
+            mlflow.log_metrics({
+                "final_train_error": float(final_train_error),
+                "final_train_accuracy": float(final_train_accuracy)
+            })
 
     def inference(self):
         """
@@ -664,26 +711,34 @@ class charSeqRNN(object):
             self.args["outputDelay"],
         )
 
-        print(
-            "Val Batch: "
-            + str(i)
-            + "/"
-            + str(self.args["nBatchesToTrain"])
-            + ", valErr: "
-            + str(runResults["err"])
-            + ", trainErr: "
-            + str(runResultsTrain["err"])
-            + ", Val Acc.: "
-            + str(valAcc)
-            + ", Train Acc.: "
-            + str(trainAcc)
-            + ", grad: "
-            + str(runResults["gradNorm"])
-            + ", learnRate: "
-            + str(lr)
-            + ", time: "
-            + str(totalSeconds)
-        )
+
+        # print(
+        #     "Val Batch: "
+        #     + str(i)
+        #     + "/"
+        #     + str(self.args["nBatchesToTrain"])
+        #     + ", valErr: "
+        #     + str(runResults["err"])
+        #     + ", trainErr: "
+        #     + str(runResultsTrain["err"])
+        #     + ", Val Acc.: "
+        #     + str(valAcc)
+        #     + ", Train Acc.: "
+        #     + str(trainAcc)
+        #     + ", grad: "
+        #     + str(runResults["gradNorm"])
+        #     + ", learnRate: "
+        #     + str(lr)
+        #     + ", time: "
+        #     + str(totalSeconds)
+        # )
+
+        # Log validation metrics to MLflow
+        mlflow.log_metrics({
+            "val_error": float(runResults["err"]),
+            "val_accuracy": float(valAcc),
+            "val_gradient_norm": float(runResults["gradNorm"])
+        }, step=i)
 
         outputSnapshot = {}
         outputSnapshot["inputs"] = runResults["inputFeatures"][0, :, :]
@@ -696,7 +751,147 @@ class charSeqRNN(object):
         outputSnapshot["charStartTarget"] = runResults["targets"][0, :, -1]
         outputSnapshot["errorWeight"] = runResults["batchWeight"][0, :]
 
+        # Generate and save figures
+        if i % (self.args["batchesPerModelSave"]) == 0:
+            self._generateAndSaveFigures(i, outputSnapshot)
+
         return [i, runResults["err"], runResults["gradNorm"], valAcc], outputSnapshot
+
+    def _generateAndSaveFigures(self, batch_num, outputSnapshot):
+        """
+        Generates and saves training visualization figures, then logs them as MLflow artifacts.
+        Creates three types of figures similar to 04-Train.py:
+        1. Training progress (loss and accuracy)
+        2. RNN outputs visualization
+        3. Character start signal
+        """
+        figures_dir = os.path.join(self.args["outputDir"], "figures")
+        
+        # Load intermediate output for training progress plots
+        intOut_path = self.args["outputDir"] + "/intermediateOutput.mat"
+        if os.path.exists(intOut_path):
+            try:
+                intOut = scipy.io.loadmat(intOut_path)
+                
+                # Determine plot end points
+                plotEnd = np.argwhere(intOut["batchTrainStats"][:, 0] == 0)
+                if plotEnd.size > 0:
+                    plotEnd = plotEnd[0][0] - 1
+                else:
+                    plotEnd = intOut["batchTrainStats"].shape[0] - 1
+                
+                plotEndVal = np.argwhere(intOut["batchValStats"][:, 0] == 0)
+                if plotEndVal.size > 0:
+                    plotEndVal = plotEndVal[0][0] - 1
+                else:
+                    plotEndVal = intOut["batchValStats"].shape[0] - 1
+                
+                # Figure 1: Training Progress (loss and accuracy)
+                fig1 = plt.figure(figsize=(14, 4))
+                
+                plt.subplot(1, 2, 1)
+                plt.plot(
+                    intOut["batchTrainStats"][0:plotEnd, 0],
+                    gaussian_filter1d(intOut["batchTrainStats"][0:plotEnd, 1], 10),
+                )
+                plt.plot(
+                    intOut["batchValStats"][0:plotEndVal, 0],
+                    gaussian_filter1d(intOut["batchValStats"][0:plotEndVal, 1], 1),
+                )
+                plt.plot([0, intOut["batchValStats"][plotEndVal, 0]], [0.50, 0.50], "--k")
+                plt.plot([0, intOut["batchValStats"][plotEndVal, 0]], [1.0, 1.0], "--k")
+                plt.xlabel("Batch #")
+                plt.legend(["Train", "Test"])
+                plt.ylim([0, 3.75])
+                plt.ylabel("Loss")
+                
+                plt.subplot(1, 2, 2)
+                plt.plot(
+                    intOut["batchTrainStats"][0:plotEnd, 0],
+                    gaussian_filter1d(intOut["batchTrainStats"][0:plotEnd, 3], 10),
+                )
+                plt.plot(
+                    intOut["batchValStats"][0:plotEndVal, 0],
+                    gaussian_filter1d(intOut["batchValStats"][0:plotEndVal, 3], 1),
+                )
+                plt.plot([0, intOut["batchValStats"][plotEndVal, 0]], [0.8, 0.8], "--k")
+                plt.plot([0, intOut["batchValStats"][plotEndVal, 0]], [0.9, 0.9], "--k")
+                plt.ylim([0, 1.0])
+                plt.xlabel("Batch #")
+                plt.legend(["Train", "Test"])
+                plt.ylabel("Frame-by-Frame Accuracy")
+                
+                plt.suptitle("Training Progress")
+                
+                # Save and log figure 1
+                fig1_path = os.path.join(figures_dir, f"training_progress_batch_{batch_num}.png")
+                plt.savefig(fig1_path, dpi=100, bbox_inches='tight')
+                plt.close(fig1)
+                mlflow.log_artifact(fig1_path)
+                
+            except Exception as e:
+                print(f"Error creating training progress figure: {e}")
+        
+        # Figure 2: RNN Outputs Visualization
+        try:
+            fig2 = plt.figure(figsize=(12.45, 8.3))
+            
+            plt.subplot(2, 2, 1)
+            plt.imshow(np.transpose(outputSnapshot["inputs"]), aspect="auto", clim=[-1, 1])
+            plt.title("Input Features")
+            plt.ylabel("Electrode #")
+            plt.xlabel("Time Step")
+            
+            plt.subplot(2, 2, 2)
+            plt.imshow(np.transpose(outputSnapshot["rnnUnits"]), aspect="auto", clim=[-1, 1])
+            plt.title("RNN Units")
+            plt.ylabel("Unit #")
+            plt.xlabel("Time Step")
+            
+            plt.subplot(2, 2, 3)
+            plt.imshow(np.transpose(outputSnapshot["charProbOutput"]), aspect="auto")
+            plt.title("RNN Probability Outputs (Logits)")
+            plt.ylabel("Character #")
+            plt.xlabel("Time Step")
+            
+            plt.subplot(2, 2, 4)
+            plt.imshow(np.transpose(outputSnapshot["charProbTarget"]), aspect="auto")
+            plt.title("Probability One-Hot Targets")
+            plt.ylabel("Character #")
+            plt.xlabel("Time Step")
+            
+            plt.tight_layout(pad=3)
+            plt.suptitle("Inputs & Outputs for Example Snippet")
+            
+            # Save and log figure 2
+            fig2_path = os.path.join(figures_dir, f"rnn_outputs_batch_{batch_num}.png")
+            plt.savefig(fig2_path, dpi=100, bbox_inches='tight')
+            plt.close(fig2)
+            mlflow.log_artifact(fig2_path)
+            
+        except Exception as e:
+            print(f"Error creating RNN outputs figure: {e}")
+        
+        # Figure 3: Character Start Signal
+        try:
+            fig3 = plt.figure(figsize=(16, 4))
+            
+            plt.plot(np.squeeze(outputSnapshot["charStartOutput"]))
+            plt.plot(np.squeeze(outputSnapshot["charStartTarget"]))
+            plt.plot(np.squeeze(outputSnapshot["errorWeight"]))
+            plt.plot([0, outputSnapshot["errorWeight"].shape[0]], [0.3, 0.3], "--k")
+            plt.title("Char Start Signal")
+            plt.xlabel("Time Step")
+            plt.legend(["RNN Output", "Target", "Error Weight", "Threshold"])
+            
+            # Save and log figure 3
+            fig3_path = os.path.join(figures_dir, f"char_start_signal_batch_{batch_num}.png")
+            plt.savefig(fig3_path, dpi=100, bbox_inches='tight')
+            plt.close(fig3)
+            mlflow.log_artifact(fig3_path)
+            
+        except Exception as e:
+            print(f"Error creating character start signal figure: {e}")
 
     def _runBatch(self, datasetNum, dayNum, lr, computeGradient, doGradientUpdate):
         """
@@ -785,7 +980,7 @@ class charSeqRNN(object):
                 varDict["inputFactors_b_" + str(self.args["inferenceInputLayer"])] = (
                     self.inputFactors_b_all[0]
                 )
-                saver = tf.train.Saver(varDict)
+                saver = tf.compat.v1.train.Saver(varDict)
                 lastLayerSavers = []
             else:
                 lastAvailableInpLayer = -1
@@ -799,7 +994,7 @@ class charSeqRNN(object):
                             self.inputFactors_b_all[inpLayerIdx]
                         )
 
-                saver = tf.train.Saver(varDict)
+                saver = tf.compat.v1.train.Saver(varDict)
 
                 lastLayerSavers = []
                 for inpLayerIdx in range(lastAvailableInpLayer + 1, self.nInpLayers):
@@ -810,9 +1005,9 @@ class charSeqRNN(object):
                     newDict["inputFactors_b_" + str(lastAvailableInpLayer)] = (
                         self.inputFactors_b_all[inpLayerIdx]
                     )
-                    lastLayerSavers.append(tf.train.Saver(newDict))
+                    lastLayerSavers.append(tf.compat.v1.train.Saver(newDict))
 
-        self.sess.run(tf.global_variables_initializer())
+        self.sess.run(tf.compat.v1.global_variables_initializer())
         self.startingBatchNum = 0
         if self.loadingInitParams:
             saver.restore(self.sess, checkpoint_path)
@@ -952,7 +1147,7 @@ class charSeqRNN(object):
         newDataset = newDataset.batch(batchSize)
         newDataset = newDataset.prefetch(1)
 
-        iterator = newDataset.make_initializable_iterator()
+        iterator = tf.compat.v1.data.make_initializable_iterator(newDataset)
         self.sess.run(iterator.initializer)
 
         return iterator
@@ -1167,7 +1362,7 @@ def cudnnGraphSingleLayer(
     )
 
     # Bias initializer: tf.constant_initializer(0.0) is equivalent to Zeros()
-    bias_initializer = tf.keras.initializers.Zeros()
+    bias_initializer = tf.compat.v1.keras.initializers.Zeros()
 
     if direction == "forward":
         gru_layer = tf.keras.layers.GRU(
@@ -1187,7 +1382,7 @@ def cudnnGraphSingleLayer(
         y_cudnn = outputs
 
         # Collect weights for L2 regularization: kernel (input weights) and recurrent_kernel (recurrent weights)
-        trainable_weights = [gru_layer.kernel, gru_layer.recurrent_kernel]
+        trainable_weights = [gru_layer.cell.kernel, gru_layer.cell.recurrent_kernel]
 
     elif direction == "backward":
         gru_layer = tf.keras.layers.GRU(
@@ -1278,10 +1473,10 @@ def gaussSmooth(inputs, kernelSD):
     for x in range(inputs.get_shape()[2]):
         convOut.append(
             tf.nn.conv1d(
-                inputs[:, :, x, tf.newaxis],
-                gaussKernel[:, np.newaxis, np.newaxis].astype(np.float32),
-                1,
-                "SAME",
+                input=inputs[:, :, x, tf.newaxis],
+                filters=gaussKernel[:, np.newaxis, np.newaxis].astype(np.float32),
+                stride=1,
+                padding="SAME",
             )
         )
 
@@ -1374,7 +1569,7 @@ def getDefaultRNNArgs():
     args["outputDelay"] = 50
 
     # Can be 'unidrectional' (causal) or 'bidirectional' (acausal)
-    args["directionality"] = "unidirectional"
+    args["directionality"] = "forward"
 
     # standard deivation of the constant-offset firing rate drift noise
     args["constantOffsetSD"] = 0.6
@@ -1436,31 +1631,3 @@ def getDefaultRNNArgs():
     args["dayProbability"] = "[1.0]"
 
     return args
-
-
-# Here we provide support for running from the command line.
-# The only command line argument is the name of an args file.
-# Launching from the command line is more reliable than launching from within a jupyter notebook, which sometimes hangs.
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
-    )
-    parser.add_argument("--argsFile", metavar="argsFile", type=str, default="args.p")
-
-    args = parser.parse_args()
-    args = vars(args)
-    argDict = pickle.load(open(args["argsFile"], "rb"))
-
-    # set the visible device to the gpu specified in 'args' (otherwise tensorflow will steal all the GPUs)
-    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-    print("Setting CUDA_VISIBLE_DEVICES to " + argDict["gpuNumber"])
-    os.environ["CUDA_VISIBLE_DEVICES"] = argDict["gpuNumber"]
-
-    # instantiate the RNN model
-    rnnModel = charSeqRNN(args=argDict)
-
-    # train or infer
-    if argDict["mode"] == "train":
-        rnnModel.train()
-    elif argDict["mode"] == "inference":
-        rnnModel.inference()

@@ -1,0 +1,83 @@
+TensorFlow 2.0 Upgrade Script
+-----------------------------
+Converted 1 files
+Detected 11 issues that require attention
+--------------------------------------------------------------------------------
+--------------------------------------------------------------------------------
+File: charSeqRNN.py
+--------------------------------------------------------------------------------
+charSeqRNN.py:178:23: WARNING: Changing dataset.make_initializable_iterator() to tf.compat.v1.data.make_initializable_iterator(dataset). Please check this transformation.
+
+charSeqRNN.py:252:29: WARNING: tf.get_variable requires manual check. tf.get_variable returns ResourceVariables by default in 2.0, which have well-defined semantics and are stricter about shapes. You can disable this behavior by passing use_resource=False, or by calling tf.compat.v1.disable_resource_variables().
+charSeqRNN.py:272:16: WARNING: tf.get_variable requires manual check. tf.get_variable returns ResourceVariables by default in 2.0, which have well-defined semantics and are stricter about shapes. You can disable this behavior by passing use_resource=False, or by calling tf.compat.v1.disable_resource_variables().
+charSeqRNN.py:280:16: WARNING: tf.get_variable requires manual check. tf.get_variable returns ResourceVariables by default in 2.0, which have well-defined semantics and are stricter about shapes. You can disable this behavior by passing use_resource=False, or by calling tf.compat.v1.disable_resource_variables().
+charSeqRNN.py:338:25: WARNING: tf.get_variable requires manual check. tf.get_variable returns ResourceVariables by default in 2.0, which have well-defined semantics and are stricter about shapes. You can disable this behavior by passing use_resource=False, or by calling tf.compat.v1.disable_resource_variables().
+charSeqRNN.py:345:25: WARNING: tf.get_variable requires manual check. tf.get_variable returns ResourceVariables by default in 2.0, which have well-defined semantics and are stricter about shapes. You can disable this behavior by passing use_resource=False, or by calling tf.compat.v1.disable_resource_variables().
+charSeqRNN.py:423:20: WARNING: tf.get_variable requires manual check. tf.get_variable returns ResourceVariables by default in 2.0, which have well-defined semantics and are stricter about shapes. You can disable this behavior by passing use_resource=False, or by calling tf.compat.v1.disable_resource_variables().
+charSeqRNN.py:471:8: WARNING: *.save requires manual check. (This warning is only applicable if the code saves a tf.Keras model) Keras model.save now saves to the Tensorflow SavedModel format by default, instead of HDF5. To continue saving to HDF5, add the argument save_format='h5' to the save() function.
+charSeqRNN.py:557:16: WARNING: *.save requires manual check. (This warning is only applicable if the code saves a tf.Keras model) Keras model.save now saves to the Tensorflow SavedModel format by default, instead of HDF5. To continue saving to HDF5, add the argument save_format='h5' to the save() function.
+charSeqRNN.py:573:8: WARNING: *.save requires manual check. (This warning is only applicable if the code saves a tf.Keras model) Keras model.save now saves to the Tensorflow SavedModel format by default, instead of HDF5. To continue saving to HDF5, add the argument save_format='h5' to the save() function.
+charSeqRNN.py:955:19: WARNING: Changing dataset.make_initializable_iterator() to tf.compat.v1.data.make_initializable_iterator(dataset). Please check this transformation.
+
+================================================================================
+Detailed log follows:
+
+================================================================================
+--------------------------------------------------------------------------------
+Processing file 'charSeqRNN.py'
+ outputting to 'charSeqRnnMigrate.py'
+--------------------------------------------------------------------------------
+
+178:23: WARNING: Changing dataset.make_initializable_iterator() to tf.compat.v1.data.make_initializable_iterator(dataset). Please check this transformation.
+
+189:28: INFO: Renamed 'tf.placeholder' to 'tf.compat.v1.placeholder'
+190:24: INFO: Renamed 'tf.placeholder' to 'tf.compat.v1.placeholder'
+252:29: WARNING: tf.get_variable requires manual check. tf.get_variable returns ResourceVariables by default in 2.0, which have well-defined semantics and are stricter about shapes. You can disable this behavior by passing use_resource=False, or by calling tf.compat.v1.disable_resource_variables().
+252:29: INFO: Renamed 'tf.get_variable' to 'tf.compat.v1.get_variable'
+256:24: INFO: tf.zeros_initializer requires manual check. Initializers no longer have the dtype argument in the constructor or partition_info argument in the __call__ method.
+The calls have been converted to compat.v1 for safety (even though they may already have been correct).
+256:24: INFO: Renamed 'tf.zeros_initializer' to 'tf.compat.v1.zeros_initializer'
+272:16: WARNING: tf.get_variable requires manual check. tf.get_variable returns ResourceVariables by default in 2.0, which have well-defined semantics and are stricter about shapes. You can disable this behavior by passing use_resource=False, or by calling tf.compat.v1.disable_resource_variables().
+272:16: INFO: Renamed 'tf.get_variable' to 'tf.compat.v1.get_variable'
+280:16: WARNING: tf.get_variable requires manual check. tf.get_variable returns ResourceVariables by default in 2.0, which have well-defined semantics and are stricter about shapes. You can disable this behavior by passing use_resource=False, or by calling tf.compat.v1.disable_resource_variables().
+280:16: INFO: Renamed 'tf.get_variable' to 'tf.compat.v1.get_variable'
+326:13: INFO: Renamed 'tf.variable_scope' to 'tf.compat.v1.variable_scope'
+338:25: WARNING: tf.get_variable requires manual check. tf.get_variable returns ResourceVariables by default in 2.0, which have well-defined semantics and are stricter about shapes. You can disable this behavior by passing use_resource=False, or by calling tf.compat.v1.disable_resource_variables().
+338:25: INFO: Renamed 'tf.get_variable' to 'tf.compat.v1.get_variable'
+341:24: INFO: tf.random_normal_initializer requires manual check. Initializers no longer have the dtype argument in the constructor or partition_info argument in the __call__ method.
+The calls have been converted to compat.v1 for safety (even though they may already have been correct).
+341:24: INFO: Renamed 'tf.random_normal_initializer' to 'tf.compat.v1.random_normal_initializer'
+345:25: WARNING: tf.get_variable requires manual check. tf.get_variable returns ResourceVariables by default in 2.0, which have well-defined semantics and are stricter about shapes. You can disable this behavior by passing use_resource=False, or by calling tf.compat.v1.disable_resource_variables().
+345:25: INFO: Renamed 'tf.get_variable' to 'tf.compat.v1.get_variable'
+348:24: INFO: tf.zeros_initializer requires manual check. Initializers no longer have the dtype argument in the constructor or partition_info argument in the __call__ method.
+The calls have been converted to compat.v1 for safety (even though they may already have been correct).
+348:24: INFO: Renamed 'tf.zeros_initializer' to 'tf.compat.v1.zeros_initializer'
+380:17: INFO: Renamed 'tf.nn.softmax_cross_entropy_with_logits_v2' to 'tf.nn.softmax_cross_entropy_with_logits'
+411:16: INFO: Renamed 'tf.get_collection' to 'tf.compat.v1.get_collection'
+411:34: INFO: Renamed 'tf.GraphKeys' to 'tf.compat.v1.GraphKeys'
+423:20: WARNING: tf.get_variable requires manual check. tf.get_variable returns ResourceVariables by default in 2.0, which have well-defined semantics and are stricter about shapes. You can disable this behavior by passing use_resource=False, or by calling tf.compat.v1.disable_resource_variables().
+423:20: INFO: Renamed 'tf.get_variable' to 'tf.compat.v1.get_variable'
+426:14: INFO: Renamed 'tf.train.AdamOptimizer' to 'tf.compat.v1.train.AdamOptimizer'
+428:22: INFO: Renamed 'tf.placeholder' to 'tf.compat.v1.placeholder'
+429:25: INFO: Renamed 'tf.assign' to 'tf.compat.v1.assign'
+435:49: INFO: Renamed 'tf.is_finite' to 'tf.math.is_finite'
+440:47: INFO: Renamed 'tf.train.get_or_create_global_step' to 'tf.compat.v1.train.get_or_create_global_step'
+453:16: INFO: Renamed 'tf.train.Saver' to 'tf.compat.v1.train.Saver'
+471:8: WARNING: *.save requires manual check. (This warning is only applicable if the code saves a tf.Keras model) Keras model.save now saves to the Tensorflow SavedModel format by default, instead of HDF5. To continue saving to HDF5, add the argument save_format='h5' to the save() function.
+557:16: WARNING: *.save requires manual check. (This warning is only applicable if the code saves a tf.Keras model) Keras model.save now saves to the Tensorflow SavedModel format by default, instead of HDF5. To continue saving to HDF5, add the argument save_format='h5' to the save() function.
+573:8: WARNING: *.save requires manual check. (This warning is only applicable if the code saves a tf.Keras model) Keras model.save now saves to the Tensorflow SavedModel format by default, instead of HDF5. To continue saving to HDF5, add the argument save_format='h5' to the save() function.
+788:24: INFO: Renamed 'tf.train.Saver' to 'tf.compat.v1.train.Saver'
+802:24: INFO: Renamed 'tf.train.Saver' to 'tf.compat.v1.train.Saver'
+813:43: INFO: Renamed 'tf.train.Saver' to 'tf.compat.v1.train.Saver'
+815:22: INFO: Renamed 'tf.global_variables_initializer' to 'tf.compat.v1.global_variables_initializer'
+913:38: INFO: Renamed 'tf.contrib.data.shuffle_and_repeat' to 'tf.data.experimental.shuffle_and_repeat'
+955:19: WARNING: Changing dataset.make_initializable_iterator() to tf.compat.v1.data.make_initializable_iterator(dataset). Please check this transformation.
+
+977:17: INFO: Renamed 'tf.where_v2' to 'tf.compat.v2.where'
+1170:23: INFO: tf.keras.initializers.Zeros requires manual check. Initializers no longer have the dtype argument in the constructor or partition_info argument in the __call__ method.
+The calls have been converted to compat.v1 for safety (even though they may already have been correct).
+1170:23: INFO: Renamed 'tf.keras.initializers.Zeros' to 'tf.compat.v1.keras.initializers.Zeros'
+1280:12: INFO: Added keywords to args of function 'tf.nn.conv1d'
+1280:12: INFO: Renamed keyword argument for tf.nn.conv1d from value to input
+--------------------------------------------------------------------------------
+
