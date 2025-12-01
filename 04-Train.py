@@ -87,28 +87,49 @@ if not os.path.isdir(args["outputDir"]):
 args["dayProbability"] = "[0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1,0.1]"
 args["dayToLayerMap"] = "[0,1,2,3,4,5,6,7,8,9]"
 
-# save the arguments dictionary so that the RNN program can load it
-pickle.dump(args, open(args["outputDir"] + "/args.p", "wb"))
 
 
 # The following code snippet will launch an RNN training program in a separate python kernel (so it doesn't launch inside
 # the jupyter notebook, which can be unstable).
-import subprocess
-import os
-
-argsFile = args["outputDir"] + "/args.p"
-scriptFile = os.getcwd() + "/charSeqRnnMigrate.py"
-process = subprocess.Popen(["python3", scriptFile, "--argsFile=" + argsFile])
-
-
-# Run this cell to visualize the training process in real-time. You can stop it at any time without interrupting the
-# training.
 import time
 from IPython import display
 from scipy.ndimage.filters import gaussian_filter1d
+import mlflow
+from charSeqRnnMigrate import charSeqRNN
 
-while process.poll() is None: # Continue as long as the subprocess is running
-    # The RNN training process periodically saves off performance statistics and a snapshot of RNN outputs, which we load here.
+# set the visible device to the gpu specified in 'args' (otherwise tensorflow will steal all the GPUs)
+os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+print("Setting CUDA_VISIBLE_DEVICES to " + args["gpuNumber"])
+os.environ["CUDA_VISIBLE_DEVICES"] = args["gpuNumber"]
+
+mlflow.set_tracking_uri("https://mission.tumi.dev/mlflow/")
+
+# instantiate the RNN model
+rnnModel = charSeqRNN(args=args)
+
+# train or infer
+with mlflow.start_run(log_system_metrics=True):
+    # Log parameters - filter to only include serializable values
+    params_to_log = {}
+    for key, value in args.items():
+        # Convert value to string if it's not a simple type
+        if isinstance(value, (int, float, str, bool)):
+            params_to_log[key] = value
+        else:
+            params_to_log[key] = str(value)
+    
+    mlflow.log_params(params_to_log)
+    
+    if args["mode"] == "train":
+        rnnModel.train()
+    elif args["mode"] == "inference":
+        rnnModel.inference()
+
+# The following code snippet will launch an RNN training program in a separate python kernel (so it doesn't launch inside
+# the jupyter notebook, which can be unstable).
+# The RNN training process periodically saves off performance statistics and a snapshot of RNN outputs, which we load here.
+# This loop will continue as long as the training process is running (which is now handled by rnnModel.train() directly).
+while True:
     snapshot_path = args["outputDir"] + "/outputSnapshot.mat"
     intOut_path = args["outputDir"] + "/intermediateOutput.mat"
 
@@ -127,10 +148,16 @@ while process.poll() is None: # Continue as long as the subprocess is running
     display.clear_output(wait=True)
 
     plotEnd = np.argwhere(intOut["batchTrainStats"][:, 0] == 0)
-    plotEnd = plotEnd[1][0] - 1
+    if plotEnd.size > 0:
+        plotEnd = plotEnd[1][0] - 1
+    else:
+        plotEnd = intOut["batchTrainStats"].shape[0] - 1
 
     plotEndVal = np.argwhere(intOut["batchValStats"][:, 0] == 0)
-    plotEndVal = plotEndVal[1][0] - 1
+    if plotEndVal.size > 0:
+        plotEndVal = plotEndVal[1][0] - 1
+    else:
+        plotEndVal = intOut["batchValStats"].shape[0] - 1
 
     # ----Training loss & frame-by-frame accuracy----
     plt.figure(figsize=(14, 4))
