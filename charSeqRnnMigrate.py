@@ -9,6 +9,9 @@ from scipy.ndimage.filters import gaussian_filter1d
 import scipy.special
 import pickle
 import mlflow
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend for server environments
+import matplotlib.pyplot as plt
 
 from tqdm import tqdm
 from dataPreprocessing import prepareDataCubesForRNN
@@ -471,6 +474,11 @@ class charSeqRNN(object):
             batchTrainStats = resumedStats["batchTrainStats"]
             batchValStats = resumedStats["batchValStats"]
 
+        # Create figures directory if it doesn't exist
+        figures_dir = os.path.join(self.args["outputDir"], "figures")
+        if not os.path.exists(figures_dir):
+            os.makedirs(figures_dir)
+        
         # Save initial model parameters.
         mlflow.log_param("initial_model_parameters", self.args["outputDir"] + "/model.ckpt")
         saver.save(
@@ -706,26 +714,26 @@ class charSeqRNN(object):
         )
 
 
-        print(
-            "Val Batch: "
-            + str(i)
-            + "/"
-            + str(self.args["nBatchesToTrain"])
-            + ", valErr: "
-            + str(runResults["err"])
-            + ", trainErr: "
-            + str(runResultsTrain["err"])
-            + ", Val Acc.: "
-            + str(valAcc)
-            + ", Train Acc.: "
-            + str(trainAcc)
-            + ", grad: "
-            + str(runResults["gradNorm"])
-            + ", learnRate: "
-            + str(lr)
-            + ", time: "
-            + str(totalSeconds)
-        )
+        # print(
+        #     "Val Batch: "
+        #     + str(i)
+        #     + "/"
+        #     + str(self.args["nBatchesToTrain"])
+        #     + ", valErr: "
+        #     + str(runResults["err"])
+        #     + ", trainErr: "
+        #     + str(runResultsTrain["err"])
+        #     + ", Val Acc.: "
+        #     + str(valAcc)
+        #     + ", Train Acc.: "
+        #     + str(trainAcc)
+        #     + ", grad: "
+        #     + str(runResults["gradNorm"])
+        #     + ", learnRate: "
+        #     + str(lr)
+        #     + ", time: "
+        #     + str(totalSeconds)
+        # )
 
         # Log validation metrics to MLflow
         mlflow.log_metrics({
@@ -745,7 +753,147 @@ class charSeqRNN(object):
         outputSnapshot["charStartTarget"] = runResults["targets"][0, :, -1]
         outputSnapshot["errorWeight"] = runResults["batchWeight"][0, :]
 
+        # Generate and save figures
+        if i % (self.args["batchesPerModelSave"]) == 0:
+            self._generateAndSaveFigures(i, outputSnapshot)
+
         return [i, runResults["err"], runResults["gradNorm"], valAcc], outputSnapshot
+
+    def _generateAndSaveFigures(self, batch_num, outputSnapshot):
+        """
+        Generates and saves training visualization figures, then logs them as MLflow artifacts.
+        Creates three types of figures similar to 04-Train.py:
+        1. Training progress (loss and accuracy)
+        2. RNN outputs visualization
+        3. Character start signal
+        """
+        figures_dir = os.path.join(self.args["outputDir"], "figures")
+        
+        # Load intermediate output for training progress plots
+        intOut_path = self.args["outputDir"] + "/intermediateOutput.mat"
+        if os.path.exists(intOut_path):
+            try:
+                intOut = scipy.io.loadmat(intOut_path)
+                
+                # Determine plot end points
+                plotEnd = np.argwhere(intOut["batchTrainStats"][:, 0] == 0)
+                if plotEnd.size > 0:
+                    plotEnd = plotEnd[0][0] - 1
+                else:
+                    plotEnd = intOut["batchTrainStats"].shape[0] - 1
+                
+                plotEndVal = np.argwhere(intOut["batchValStats"][:, 0] == 0)
+                if plotEndVal.size > 0:
+                    plotEndVal = plotEndVal[0][0] - 1
+                else:
+                    plotEndVal = intOut["batchValStats"].shape[0] - 1
+                
+                # Figure 1: Training Progress (loss and accuracy)
+                fig1 = plt.figure(figsize=(14, 4))
+                
+                plt.subplot(1, 2, 1)
+                plt.plot(
+                    intOut["batchTrainStats"][0:plotEnd, 0],
+                    gaussian_filter1d(intOut["batchTrainStats"][0:plotEnd, 1], 10),
+                )
+                plt.plot(
+                    intOut["batchValStats"][0:plotEndVal, 0],
+                    gaussian_filter1d(intOut["batchValStats"][0:plotEndVal, 1], 1),
+                )
+                plt.plot([0, intOut["batchValStats"][plotEndVal, 0]], [0.50, 0.50], "--k")
+                plt.plot([0, intOut["batchValStats"][plotEndVal, 0]], [1.0, 1.0], "--k")
+                plt.xlabel("Batch #")
+                plt.legend(["Train", "Test"])
+                plt.ylim([0, 3.75])
+                plt.ylabel("Loss")
+                
+                plt.subplot(1, 2, 2)
+                plt.plot(
+                    intOut["batchTrainStats"][0:plotEnd, 0],
+                    gaussian_filter1d(intOut["batchTrainStats"][0:plotEnd, 3], 10),
+                )
+                plt.plot(
+                    intOut["batchValStats"][0:plotEndVal, 0],
+                    gaussian_filter1d(intOut["batchValStats"][0:plotEndVal, 3], 1),
+                )
+                plt.plot([0, intOut["batchValStats"][plotEndVal, 0]], [0.8, 0.8], "--k")
+                plt.plot([0, intOut["batchValStats"][plotEndVal, 0]], [0.9, 0.9], "--k")
+                plt.ylim([0, 1.0])
+                plt.xlabel("Batch #")
+                plt.legend(["Train", "Test"])
+                plt.ylabel("Frame-by-Frame Accuracy")
+                
+                plt.suptitle("Training Progress")
+                
+                # Save and log figure 1
+                fig1_path = os.path.join(figures_dir, f"training_progress_batch_{batch_num}.png")
+                plt.savefig(fig1_path, dpi=100, bbox_inches='tight')
+                plt.close(fig1)
+                mlflow.log_artifact(fig1_path)
+                
+            except Exception as e:
+                print(f"Error creating training progress figure: {e}")
+        
+        # Figure 2: RNN Outputs Visualization
+        try:
+            fig2 = plt.figure(figsize=(12.45, 8.3))
+            
+            plt.subplot(2, 2, 1)
+            plt.imshow(np.transpose(outputSnapshot["inputs"]), aspect="auto", clim=[-1, 1])
+            plt.title("Input Features")
+            plt.ylabel("Electrode #")
+            plt.xlabel("Time Step")
+            
+            plt.subplot(2, 2, 2)
+            plt.imshow(np.transpose(outputSnapshot["rnnUnits"]), aspect="auto", clim=[-1, 1])
+            plt.title("RNN Units")
+            plt.ylabel("Unit #")
+            plt.xlabel("Time Step")
+            
+            plt.subplot(2, 2, 3)
+            plt.imshow(np.transpose(outputSnapshot["charProbOutput"]), aspect="auto")
+            plt.title("RNN Probability Outputs (Logits)")
+            plt.ylabel("Character #")
+            plt.xlabel("Time Step")
+            
+            plt.subplot(2, 2, 4)
+            plt.imshow(np.transpose(outputSnapshot["charProbTarget"]), aspect="auto")
+            plt.title("Probability One-Hot Targets")
+            plt.ylabel("Character #")
+            plt.xlabel("Time Step")
+            
+            plt.tight_layout(pad=3)
+            plt.suptitle("Inputs & Outputs for Example Snippet")
+            
+            # Save and log figure 2
+            fig2_path = os.path.join(figures_dir, f"rnn_outputs_batch_{batch_num}.png")
+            plt.savefig(fig2_path, dpi=100, bbox_inches='tight')
+            plt.close(fig2)
+            mlflow.log_artifact(fig2_path)
+            
+        except Exception as e:
+            print(f"Error creating RNN outputs figure: {e}")
+        
+        # Figure 3: Character Start Signal
+        try:
+            fig3 = plt.figure(figsize=(16, 4))
+            
+            plt.plot(np.squeeze(outputSnapshot["charStartOutput"]))
+            plt.plot(np.squeeze(outputSnapshot["charStartTarget"]))
+            plt.plot(np.squeeze(outputSnapshot["errorWeight"]))
+            plt.plot([0, outputSnapshot["errorWeight"].shape[0]], [0.3, 0.3], "--k")
+            plt.title("Char Start Signal")
+            plt.xlabel("Time Step")
+            plt.legend(["RNN Output", "Target", "Error Weight", "Threshold"])
+            
+            # Save and log figure 3
+            fig3_path = os.path.join(figures_dir, f"char_start_signal_batch_{batch_num}.png")
+            plt.savefig(fig3_path, dpi=100, bbox_inches='tight')
+            plt.close(fig3)
+            mlflow.log_artifact(fig3_path)
+            
+        except Exception as e:
+            print(f"Error creating character start signal figure: {e}")
 
     def _runBatch(self, datasetNum, dayNum, lr, computeGradient, doGradientUpdate):
         """
