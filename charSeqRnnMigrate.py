@@ -5,9 +5,11 @@ import tensorflow as tf
 import random
 import numpy as np
 import scipy.io
-from scipy.ndimage.filters import gaussian_filter1d
+from scipy.filters import gaussian_filter1d
 import scipy.special
 import pickle
+
+from tqdm import tqdm
 from dataPreprocessing import prepareDataCubesForRNN
 import sys
 
@@ -479,6 +481,7 @@ class charSeqRNN(object):
         # This ensures we aren't accidentally changing the graph as we go (which degrades performance).
         self.sess.graph.finalize()
 
+        pbar = tqdm(total = self.args["nBatchesToTrain"], initial = i, desc = 'Training Batches')
         while i < self.args["nBatchesToTrain"]:
             # time how long this batch takes
             dtStart = datetime.now()
@@ -539,6 +542,8 @@ class charSeqRNN(object):
                 scipy.io.savemat(
                     self.args["outputDir"] + "/outputSnapshot", outputSnapshot
                 )
+                
+                pbar.update(self.args["batchesPerVal"])
 
             # save performance statistics and model parameters every so often
             if (
@@ -563,6 +568,7 @@ class charSeqRNN(object):
                 )
 
             i += 1
+        pbar.close()
 
         # save final training statistics over all batches & final model
         scipy.io.savemat(
@@ -1345,7 +1351,7 @@ def getDefaultRNNArgs():
         args["sessionName_" + str(x)] = dataDirs[x]
 
     # Specify which GPU to use (on multi-gpu machines, this prevents tensorflow from taking over all GPUs)
-    args["gpuNumber"] = "0,1,2,3,4,5,6,7"
+    args["gpuNumber"] = "0"
 
     # mode can either be 'train' or 'inference'
     args["mode"] = "train"
