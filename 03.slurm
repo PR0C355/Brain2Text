@@ -1,11 +1,11 @@
 #!/bin/bash
-#SBATCH --job-name=synthesis
+#SBATCH --job-name=b2t-synth
 #SBATCH --output=/mnt/arc/oguntola/Brain2Text/logs/%x-%j.log
 #SBATCH --error=/mnt/arc/oguntola/Brain2Text/logs/%x-%j.log
 #SBATCH --time=1-00:00:00
-#SBATCH --cpus-per-task=100
-#SBATCH --partition=defq
-#SBATCH --gres=gpu:8
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=40
+#SBATCH --partition=a6000
 
 cd /mnt/arc/oguntola/Brain2Text/
 source .venv/bin/activate
@@ -24,5 +24,3 @@ fi
 echo "Running on $(hostname) at $(date)"
 
 python 03-Synthesis.py
-# python qa.py --model "deepseek-ai/DeepSeek-R1-Distill-Llama-70B"
-# python qa.py --model "Qwen/Qwen2.5-72B-Instruct"

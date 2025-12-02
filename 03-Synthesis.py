@@ -24,7 +24,7 @@ import datetime
 from dataPreprocessing import normalizeSentenceDataCube
 
 # point this towards the top level dataset directory
-rootDir = os.path.expanduser(".") + "/backupBCIData/"
+rootDir = os.path.expanduser(".") + "/handwritingBCIData/"
 
 # define which datasets to process
 dataDirs = [
