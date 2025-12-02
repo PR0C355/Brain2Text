@@ -953,6 +953,38 @@ class charSeqRNN(object):
                 return shared_name
             name = getattr(var, "name", "")
             return name.split(":")[0] if ":" in name else name
+        
+        def _find_gru_cell_checkpoint_name(var, var_names_ckpt):
+            """
+            For Keras GRU cell variables, explicitly search for matching checkpoint names.
+            This is needed because after keras.backend.clear_session(), the variable name
+            mapping can be unreliable.
+            """
+            var_name = _get_checkpoint_name(var)
+            
+            # If it's a GRU cell variable, try to match it to checkpoint names
+            if 'gru_cell' in var_name or any(part in var_name for part in ['kernel', 'recurrent_kernel', 'bias']):
+                # Try direct match first
+                if var_name in var_names_ckpt:
+                    return var_name
+                
+                # For variables that might have been created by Keras after backend reset,
+                # try to find a match based on the variable's scope and type
+                base_name = var_name.split('/')[-1]  # e.g., 'kernel', 'recurrent_kernel', 'bias'
+                
+                # Check if this is layer2 GRU
+                if 'layer2' in var.name or any('layer2' in scope for scope in var.name.split('/')):
+                    # Try layer2/gru_1/gru_cell/...
+                    candidate = f'layer2/gru_1/gru_cell/{base_name}'
+                    if candidate in var_names_ckpt:
+                        return candidate
+                else:
+                    # Try gru/gru_cell/...
+                    candidate = f'gru/gru_cell/{base_name}'
+                    if candidate in var_names_ckpt:
+                        return candidate
+            
+            return var_name
 
         if self.loadingInitParams:
             # find the variables in the checkpoint
@@ -1029,6 +1061,11 @@ class charSeqRNN(object):
             reader = tf.train.load_checkpoint(checkpoint_path)
             for var in tf.compat.v1.trainable_variables():
                 var_name = _get_checkpoint_name(var)
+                
+                # For GRU cell variables, use special matching logic
+                if 'gru' in var.name.lower() or any(part in var_name for part in ['kernel', 'recurrent_kernel', 'bias']):
+                    var_name = _find_gru_cell_checkpoint_name(var, var_names_ckpt)
+                
                 if reader.has_tensor(var_name):
                     self.sess.run(var.assign(reader.get_tensor(var_name)))
                 else:
@@ -1537,7 +1574,8 @@ def getDefaultRNNArgs():
 
     # These arguments define each dataset that will be used for training.
     rootDir = "/home/fwillett/handwritingDatasetsForRelease/"
-    dataDirs = ["t5.2019.05.08"]
+    # dataDirs = ["t5.2019.05.08"]
+    dataDirs = ['t5.2019.05.08','t5.2019.11.25','t5.2019.12.09','t5.2019.12.11','t5.2019.12.18', 't5.2019.12.20','t5.2020.01.06','t5.2020.01.08','t5.2020.01.13','t5.2020.01.15']
     cvPart = "HeldOutBlocks"
 
     for x in range(len(dataDirs)):

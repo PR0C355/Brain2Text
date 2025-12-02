@@ -9,7 +9,7 @@ import os
 from charSeqRnnMigrate import getDefaultRNNArgs
 
 # point this towards the top level dataset directory
-rootDir = os.path.expanduser(".") + "/backupBCIData/"
+rootDir = os.path.expanduser(".") + "/handwritingBCIData/"
 
 # train an RNN using data from these specified sessions
 dataDirs = [
