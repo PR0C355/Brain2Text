@@ -952,9 +952,8 @@ class charSeqRNN(object):
 
             # print variables in the checkpoint
             print("Loading from checkpoint: " + checkpoint_path)
-            from tensorflow.contrib.framework.python.framework import checkpoint_utils
-
-            var_list_ckpt = checkpoint_utils.list_variables(checkpoint_path)
+            # In TensorFlow 2.x, checkpoint_utils.list_variables is available directly under tf.train
+            var_list_ckpt = tf.train.list_variables(checkpoint_path)
             var_names_ckpt = []
             for v in var_list_ckpt:
                 var_names_ckpt.append(v[0])
