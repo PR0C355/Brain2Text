@@ -20,8 +20,9 @@ import argparse
 rootDir = os.path.expanduser('.') + '/backupBCIData/'
 
 #evaluate the RNN on these datasets
-dataDirs = ['t5.2019.05.08','t5.2019.11.25','t5.2019.12.09','t5.2019.12.11','t5.2019.12.18',
-            't5.2019.12.20','t5.2020.01.06','t5.2020.01.08','t5.2020.01.13','t5.2020.01.15']
+# dataDirs = ['t5.2019.05.08','t5.2019.11.25','t5.2019.12.09','t5.2019.12.11','t5.2019.12.18',
+#             't5.2019.12.20','t5.2020.01.06','t5.2020.01.08','t5.2020.01.13','t5.2020.01.15']
+dataDirs = ['t5.2019.05.08']
 
 #use this train/test partition
 cvPart = 'HeldOutTrials'
@@ -77,14 +78,19 @@ for x in range(len(dataDirs)):
     args['inferenceOutputFileName'] = inferenceSaveDir + '/' + dataDirs[x] + '_inferenceOutputs.mat'
     args['inferenceInputLayer'] = x
     
+    # Reset Keras backend AND TensorFlow graph BEFORE instantiating the model
+    # This ensures consistent variable naming across all iterations
+    tf.keras.backend.clear_session()
+    tf.compat.v1.reset_default_graph()
+    
     #instantiate the RNN model
     rnnModel = charSeqRNN(args=args)
 
     #evaluate the RNN on the held-out data
     outputs = rnnModel.inference()
     
-    #reset the graph to make space for the next dataset
-    tf.compat.v1.reset_default_graph()
+    # Close the session to free up memory
+    rnnModel.sess.close()
 
 
 
