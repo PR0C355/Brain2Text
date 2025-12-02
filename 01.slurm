@@ -5,7 +5,6 @@
 #SBATCH --time=1-00:00:00
 #SBATCH --cpus-per-task=4
 #SBATCH --partition=defq
-#SBATCH --gres=gpu:8
 
 cd /mnt/arc/oguntola/Brain2Text/
 source .venv/bin/activate
@@ -23,6 +22,6 @@ fi
 
 echo "Running on $(hostname) at $(date)"
 
-python 01-TimeWarp.py
+python -m cProfile -o time_warp.prof 01-TimeWarp.py
 # python qa.py --model "deepseek-ai/DeepSeek-R1-Distill-Llama-70B"
 # python qa.py --model "Qwen/Qwen2.5-72B-Instruct"

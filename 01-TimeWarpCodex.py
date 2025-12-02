@@ -16,8 +16,8 @@ from characterDefinitions import getHandwritingCharacterDefinitions
 rootDir = os.path.expanduser(".") + "/handwritingBCIData/"
 
 # this line limits which GPUs CUDA-aware libraries can see (optional; comment out or edit as needed)
-# os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3,4,5,6,7"  # to use all GPUs
+os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+# os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3,4,5,6,7"  # to use all GPUs
 
 # defines all the sessions that will be time-warped
 dataDirs = [

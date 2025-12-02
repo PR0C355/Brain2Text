@@ -24,8 +24,8 @@ from characterDefinitions import getHandwritingCharacterDefinitions
 rootDir = os.path.expanduser(".") + "/handwritingBCIData/"
 
 # this line ensures that tensorflow will only use GPU 0 (keeps it from taking over all the GPUs in a multi-gpu setup)
-# os.environ["CUDA_VISIBLE_DEVICES"]='0'
-os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3,4,5,6,7"  # to use all GPUs
+os.environ["CUDA_VISIBLE_DEVICES"]='1'
+# os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3,4,5,6,7"  # to use all GPUs
 
 # defines all the sessions that will be time-warped
 dataDirs = [
