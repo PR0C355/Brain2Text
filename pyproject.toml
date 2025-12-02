@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "absl-py>=2.3.1",
     "affinewarp>=0.2.0",
     "ipykernel>=7.1.0",
     "matplotlib>=3.10.7",
