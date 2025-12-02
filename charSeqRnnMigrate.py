@@ -941,6 +941,19 @@ class charSeqRNN(object):
         """
         Initializes all tensorflow variables on the graph, optionally loading their values from a specified file.
         """
+        def _get_checkpoint_name(var):
+            """
+            TensorFlow 2 Keras variables (especially layer kernels) sometimes expose only a base
+            name (e.g., 'kernel') via `var.name`, while the checkpoint stores the full shared name
+            with scope (e.g., 'gru/gru_cell/kernel'). Prefer the shared name when available and
+            fall back to stripping any ':0' suffix.
+            """
+            shared_name = getattr(var, "_shared_name", None)
+            if shared_name:
+                return shared_name
+            name = getattr(var, "name", "")
+            return name.split(":")[0] if ":" in name else name
+
         if self.loadingInitParams:
             # find the variables in the checkpoint
             ckpt = tf.train.get_checkpoint_state(self.args["loadDir"])
@@ -964,13 +977,11 @@ class charSeqRNN(object):
             lv = [
                 self.readout_W,
                 self.readout_b,
-                self.rnnWeightVars[0],
-                self.rnnWeightVars2[0],
                 self.rnnStartState,
             ]
             varDict = {}
             for x in range(len(lv)):
-                varDict[lv[x].name[:-2]] = lv[x]
+                varDict[_get_checkpoint_name(lv[x])] = lv[x]
 
             if self.args["mode"] == "infer":
                 varDict["inputFactors_W_" + str(self.args["inferenceInputLayer"])] = (
@@ -1012,6 +1023,20 @@ class charSeqRNN(object):
             saver.restore(self.sess, checkpoint_path)
             for s in lastLayerSavers:
                 s.restore(self.sess, checkpoint_path)
+
+            # Manually restore trainable variables (including Keras GRU weights) whose resource
+            # names do not map cleanly through tf.train.Saver.
+            reader = tf.train.load_checkpoint(checkpoint_path)
+            for var in tf.compat.v1.trainable_variables():
+                var_name = _get_checkpoint_name(var)
+                if reader.has_tensor(var_name):
+                    self.sess.run(var.assign(reader.get_tensor(var_name)))
+                else:
+                    print(
+                        "Warning: {} not found in checkpoint {}, leaving initializer value.".format(
+                            var_name, checkpoint_path
+                        )
+                    )
 
             if self.resumeTraining:
                 self.startingBatchNum = int(

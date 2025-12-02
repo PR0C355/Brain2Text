@@ -84,7 +84,7 @@ for x in range(len(dataDirs)):
     outputs = rnnModel.inference()
     
     #reset the graph to make space for the next dataset
-    tf.reset_default_graph()
+    tf.compat.v1.reset_default_graph()
 
 
 
